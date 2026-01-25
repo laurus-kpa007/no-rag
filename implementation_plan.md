@@ -1,41 +1,48 @@
-# No-RAG Ollama Q&A 봇 구현 계획
+# Advanced Multi-Mode RAG Bot 구현 계획
 
-이 계획은 복잡한 RAG/Vector DB 설정을 우회하여 "Full Context Stuffing" 방식을 사용하는 문서 기반 Q&A 봇 파이썬 스크립트 작성을 상세히 기술합니다.
+사용자가 요청한 4가지 검색 모드(파일, 벡터, 키워드, 하이브리드)를 지원하고, Ollama의 역할을 세분화(임베딩, 리랭크, 챗)하여 설정할 수 있는 고도화된 봇을 개발합니다.
 
-## 사용자 검토 필요
+## User Review Required
 > [!IMPORTANT]
-> 이 스크립트는 워드 문서의 **전체** 내용을 LLM의 컨텍스트 윈도우에 로드합니다. 
-> - `llama3.1`, `qwen2.5` (128k 컨텍스트) 등 컨텍스트 윈도우가 큰 Ollama 모델을 사용하거나 문서 크기가 충분히 작은지 확인하세요.
-> - 문서가 너무 크면 모델이 텍스트를 자르거나 처리에 실패할 수 있습니다.
+> - **추가 라이브러리**: `chromadb` (벡터 저장소), `rank_bm25` (키워드 검색) 설치가 필요합니다.
+> - **Rerank 속도**: Ollama LLM을 리랭커로 사용 시(GenAI Reranking), 문서마다 LLM 호출이 발생하여 속도가 느릴 수 있습니다.
+> - **파일 분할(Chunking)**: RAG를 위해서는 문서를 잘게 쪼개는 Chunking 로직이 필수적으로 추가됩니다.
 
-## 변경 제안
+## Proposed Changes
 
-### 프로젝트 루트 (`d:/Python/no-rag/`)
+### Project Root (`d:/Python/no-rag/`)
 
-#### [NEW] [no_rag_bot.py](file:///d:/Python/no-rag/no_rag_bot.py)
-- **Imports**: `ollama`, `docx` (python-docx), `sys`
-- **설정**: 상단에 `DOC_PATH` 변수 (기본값 'data.docx').
-- **함수**:
-    - `extract_text_from_docx(file_path)`: .docx 파일의 모든 단락과 표를 읽어 하나의 문자열로 반환.
-    - `chat_with_doc(doc_content)`: 메인 루프:
-        1. 사용자 입력 수신.
-        2. 종료 키워드 확인 ('q', 'exit').
-        3. 프롬프트 구성: `Context:\n{doc_content}\n\nQuestion:\n{user_input}`.
-        4. `stream=True`로 `ollama.chat` 호출.
-        5. 청크를 표준 출력(stdout)으로 출력.
-- **메인 실행**:
-    - 파일 존재 여부 확인.
-    - 데이터 로드.
-    - 채팅 루프 시작.
-- **헤더 주석**: `pip install ollama python-docx` 포함.
+#### [NEW] [advanced_rag_bot.py](file:///d:/Python/no-rag/advanced_rag_bot.py)
+단일 파일에 모든 로직을 담되, 클래스 구조로 깔끔하게 분리합니다.
 
-## 검증 계획
+1.  **Config Class**:
+    - `OLLAMA_CHAT_HOST`, `OLLAMA_EMBED_HOST`
+    - `MODEL_CHAT`, `MODEL_EMBED`, `MODEL_RERANK`
+    - `SEARCH_MODE` (1~4)
+    - `NUM_CTX`
 
-### 수동 검증
-1.  **의존성 설치**: 사용자가 `pip install ollama python-docx` 실행.
-2.  **데이터 준비**: 폴더에 `data.docx` 이름으로 워드 파일 배치.
-3.  **스크립트 실행**: `python no_rag_bot.py` 실행.
-4.  **상호작용 테스트**:
-    -   문서 내용에 대해 질문.
-    -   답변이 스트리밍되는지 확인.
-    -   'q' 입력 시 종료되는지 확인.
+2.  **DocumentProcessor**:
+    - `load_document(path)`: 기존 로직 재사용.
+    - `chunk_text(text, size=1000)`: 텍스트를 겹치게(overlap) 분할.
+
+3.  **Retriever Classes**:
+    - `VectorRetriever`: `chromadb` 사용. Ollama Embedding API 호출.
+    - `KeywordRetriever`: `rank_bm25` 사용. 텍스트 토크나이징.
+    - `HybridRetriever`: 두 결과 합치기 (Weighted Sum 또는 RRF).
+
+4.  **Reranker**:
+    - `rate_documents(query, docs)`: LLM에게 "이 문서가 질문과 관련이 있나요? 0~10점" 프롬프트 전송 후 정렬.
+
+5.  **Main Loop**:
+    - 시작 시 모드 선택 (1. File, 2. Vector, 3. Keyword, 4. Hybrid)
+    - 설정 확인 및 변경 메뉴 제공.
+    - 질문 -> 검색 -> (리랭크) -> 답변 생성.
+
+## Verification Plan
+
+### Automated/Manual Tests
+1.  **Dependencies**: `pip install chromadb rank_bm25 ollama python-docx`
+2.  **Mode 1 (File)**: 기존과 동일하게 작동하는지 확인.
+3.  **Mode 2 (Vector)**: 질문과 의미가 유사한 청크가 검색되는지 확인.
+4.  **Mode 3 (Keyword)**: 특정 단어가 포함된 청크가 검색되는지 확인.
+5.  **Mode 4 (Hybrid)**: 두 결과가 섞여서 나오고, Rerank 과정을 거치는지 확인.

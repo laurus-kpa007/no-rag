@@ -19,9 +19,9 @@ class Config:
     OLLAMA_HOST = 'http://localhost:11434'
     
     # 모델 설정
-    MODEL_CHAT = 'gemma3:4b'      # 답변 생성용 LLM
-    MODEL_EMBED = 'nomic-embed-text' # 임베딩용 모델 (없으면 'ollama pull nomic-embed-text')
-    MODEL_RERANK = 'gemma3:4b'    # 리랭킹용 LLM (가벼운 모델 권장)
+    MODEL_CHAT = 'gemma3:12b'      # 답변 생성용 LLM
+    MODEL_EMBED = 'bge-m3' # 임베딩용 모델 (없으면 'ollama pull nomic-embed-text')
+    MODEL_RERANK = 'gemma3:12b'    # 리랭킹용 LLM (가벼운 모델 권장)
     
     # 검색 설정
     CHUNK_SIZE = 500              # 청크 크기 (글자 수)
@@ -156,8 +156,38 @@ class KeywordStore:
         return [self.chunks[i] for i in top_n_indexes]
 
 # ==========================================
-# 4. Reranker (LLM 기반)
+# 4. Reranker & Query Refiner (LLM 기반)
 # ==========================================
+def correct_query(query, context_chunks=None):
+    """
+    사용자 질문의 오타와 띄어쓰기를 교정합니다. (문맥 인식)
+    """
+    context_instruction = ""
+    if context_chunks:
+        snippets = "\n".join([c[:200] + "..." for c in context_chunks])
+        context_instruction = f"""
+[참고 문서 내용]
+{snippets}
+
+위 [참고 문서 내용]에 등장하는 전문 용어나 표현을 우선적으로 사용하여 교정하세요.
+"""
+
+    prompt = f"""
+당신은 문법 및 용어 교정기입니다. 
+아래 [질문]의 오타와 띄어쓰기를 교정하세요.
+{context_instruction}
+설명 없이 수정된 문장만 출력하세요.
+
+[질문]
+{query}
+"""
+    try:
+        res = ollama.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+        corrected = res['message']['content'].strip()
+        return corrected.replace('"', '').replace("'", "")
+    except:
+        return query
+
 def rerank_documents(query, docs):
     """
     LLM을 사용하여 문서의 연관성을 평가하고 재정렬합니다.
@@ -230,8 +260,25 @@ def main():
         mode = input("검색 모드를 선택하세요 (1-4): ").strip()
         if mode.lower() in ['q', 'exit']: break
         
-        query = input("\n질문: ").strip()
-        if not query: continue
+        original_query = input("\n질문: ").strip()
+        if not original_query: continue
+
+        # 문맥 기반 질문 교정
+        print("   [Query] 오타 및 용어 교정 중... (문맥 파악)")
+        try:
+            # 1. 벡터 검색으로 관련 문맥(청크)를 먼저 가져옴 (오타에 강함)
+            # 전체 검색 모드(1번)일 때는 굳이 안 해도 되지만, 정확도를 위해 수행
+            pre_search_docs = vector_store.search(original_query, top_k=3)
+        except Exception as e:
+            print(f"   [Warning] 문맥 파악 실패: {e}")
+            pre_search_docs = []
+            
+        query = correct_query(original_query, context_chunks=pre_search_docs)
+        
+        if query != original_query:
+            print(f"   => 교정된 질문: {query}")
+        else:
+             print(f"   => 질문: {query}")
 
         context = ""
         

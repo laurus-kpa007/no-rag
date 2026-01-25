@@ -1,8 +1,7 @@
 - [x] 구현 계획 작성 <!-- id: 0 -->
 - [x] 간단한 Q&A 스크립트 작성 (`no_rag_bot.py`) <!-- id: 1 -->
-    - [x] 라이브러리 임포트 (`ollama`, `python-docx`) <!-- id: 2 -->
-    - [x] docx 텍스트 추출 구현 <!-- id: 3 -->
-    - [x] 메인 상호작용 루프 구현 <!-- id: 4 -->
-    - [x] Ollama 스트리밍 통합 <!-- id: 5 -->
-- [x] 테스트용 더미 .docx 파일 생성 (선택사항) <!-- id: 6 -->
-- [x] 스크립트 로직 검증 <!-- id: 7 -->
+- [x] 고급 멀티 모드 RAG 봇 개발 (`advanced_rag_bot.py`) <!-- id: 11 -->
+- [x] 문서 로딩 버그 수정 (Deep XML Extraction) <!-- id: 18 -->
+- [x] GitHub 리포지토리 생성 및 푸시 (`no-rag`) <!-- id: 19 -->
+- [x] README.md 작성 및 푸시 <!-- id: 20 -->
+- [x] 오타 및 띄어쓰기 보정 기능 추가 (LLM Query Correction) <!-- id: 21 -->
