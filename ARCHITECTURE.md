@@ -10,10 +10,11 @@
 2. [전체 시스템 아키텍처](#2-전체-시스템-아키텍처)
 3. [No-RAG Bot 상세](#3-no-rag-bot-상세)
 4. [Advanced RAG Bot 상세](#4-advanced-rag-bot-상세)
-5. [검색 모드별 흐름도](#5-검색-모드별-흐름도)
-6. [클래스 다이어그램](#6-클래스-다이어그램)
-7. [데이터 흐름](#7-데이터-흐름)
-8. [외부 의존성](#8-외부-의존성)
+5. [문서 인덱싱 상세](#5-문서-인덱싱-상세)
+6. [검색 모드별 흐름도](#6-검색-모드별-흐름도)
+7. [클래스 다이어그램](#7-클래스-다이어그램)
+8. [데이터 흐름](#8-데이터-흐름)
+9. [외부 의존성](#9-외부-의존성)
 
 ---
 
@@ -389,9 +390,437 @@ flowchart TD
 
 ---
 
-## 5. 검색 모드별 흐름도
+## 5. 문서 인덱싱 상세
 
-### 5.1 벡터 검색 (Semantic Search) 상세
+이 섹션에서는 문서가 검색 가능한 형태로 변환되는 **인덱싱 과정**을 상세히 설명합니다.
+
+### 5.1 인덱싱 전체 흐름
+
+```mermaid
+flowchart TD
+    subgraph LOAD["1단계: 문서 로딩"]
+        FILE[원본 파일<br/>.docx / .md / .txt] --> DETECT{파일 형식 감지}
+        DETECT -->|.docx| DEEP_XML[Deep XML 추출<br/>모든 w:t 태그 스캔]
+        DETECT -->|.md/.txt| SIMPLE[단순 텍스트 읽기]
+        DEEP_XML --> RAW_TEXT[원본 텍스트]
+        SIMPLE --> RAW_TEXT
+    end
+
+    subgraph CHUNK["2단계: 텍스트 청킹"]
+        RAW_TEXT --> SLIDING[슬라이딩 윈도우 분할]
+        SLIDING --> CHUNKS["청크 리스트<br/>[chunk_0, chunk_1, ..., chunk_n]"]
+    end
+
+    subgraph INDEX["3단계: 듀얼 인덱싱"]
+        CHUNKS --> PARALLEL{병렬 처리}
+
+        PARALLEL --> VEC_PATH[벡터 인덱싱 경로]
+        PARALLEL --> KEY_PATH[키워드 인덱싱 경로]
+
+        subgraph VECTOR_INDEX["벡터 인덱싱"]
+            VEC_PATH --> EMB_LOOP[각 청크에 대해]
+            EMB_LOOP --> OLLAMA_EMB[Ollama API 호출<br/>model: bge-m3]
+            OLLAMA_EMB --> VEC_768[768차원 벡터 생성]
+            VEC_768 --> CHROMA_ADD[ChromaDB에 추가<br/>document + embedding + id]
+        end
+
+        subgraph KEYWORD_INDEX["키워드 인덱싱"]
+            KEY_PATH --> TOKENIZE[각 청크 토큰화<br/>공백 기준 분리]
+            TOKENIZE --> CORPUS["토큰화된 코퍼스<br/>[[tok1, tok2], [tok3, tok4], ...]"]
+            CORPUS --> BM25_BUILD[BM25Okapi 인덱스 생성]
+        end
+    end
+
+    CHROMA_ADD --> READY[인덱싱 완료<br/>검색 준비됨]
+    BM25_BUILD --> READY
+
+    style LOAD fill:#e3f2fd
+    style CHUNK fill:#fff3e0
+    style INDEX fill:#e8f5e9
+    style VECTOR_INDEX fill:#f3e5f5
+    style KEYWORD_INDEX fill:#ffebee
+```
+
+### 5.2 문서 로딩 상세 (Deep XML 추출)
+
+```mermaid
+flowchart TD
+    subgraph INPUT["입력"]
+        DOCX_FILE[".docx 파일"]
+    end
+
+    subgraph PARSE["python-docx 파싱"]
+        DOCX_FILE --> DOC_OBJ["Document 객체 생성<br/>Document(file_path)"]
+        DOC_OBJ --> ACCESS_XML["내부 XML 접근<br/>doc.element.body"]
+    end
+
+    subgraph DEEP_EXTRACT["Deep XML 추출"]
+        ACCESS_XML --> FIND_ALL["모든 w:t 태그 검색<br/>findall('.//' + qn('w:t'))"]
+
+        FIND_ALL --> LOCATIONS["추출 대상 위치"]
+
+        LOCATIONS --> P["일반 문단<br/>(Paragraphs)"]
+        LOCATIONS --> T["표 셀 내용<br/>(Table Cells)"]
+        LOCATIONS --> TB["텍스트 박스<br/>(Text Boxes)"]
+        LOCATIONS --> SH["도형 내 텍스트<br/>(Shapes)"]
+        LOCATIONS --> HD["머리글/바닥글<br/>(Headers/Footers)"]
+
+        P --> COLLECT[텍스트 수집]
+        T --> COLLECT
+        TB --> COLLECT
+        SH --> COLLECT
+        HD --> COLLECT
+    end
+
+    subgraph OUTPUT["출력"]
+        COLLECT --> JOIN["텍스트 결합<br/>newline으로 연결"]
+        JOIN --> FULL_TEXT["전체 텍스트 문자열"]
+        FULL_TEXT --> DEBUG["디버그 파일 저장<br/>debug_extracted.txt"]
+    end
+
+    style INPUT fill:#e3f2fd
+    style DEEP_EXTRACT fill:#fff8e1
+    style OUTPUT fill:#e8f5e9
+```
+
+#### Deep XML 추출 코드 설명
+
+```python
+# 기존 방식 (누락 발생 가능)
+for para in doc.paragraphs:
+    text += para.text  # 텍스트 박스, 도형 내 텍스트 누락!
+
+# Deep XML 방식 (모든 텍스트 추출)
+from docx.oxml.ns import qn
+for t in doc.element.body.findall('.//' + qn('w:t')):
+    if t.text:
+        full_text.append(t.text)  # 모든 위치의 텍스트 포착!
+```
+
+### 5.3 텍스트 청킹 상세
+
+```mermaid
+flowchart LR
+    subgraph CONFIG["설정값"]
+        SIZE["CHUNK_SIZE = 500자"]
+        OVERLAP["CHUNK_OVERLAP = 50자"]
+    end
+
+    subgraph ALGORITHM["슬라이딩 윈도우 알고리즘"]
+        direction TB
+        TEXT["원본 텍스트<br/>(예: 2000자)"]
+
+        TEXT --> W1["윈도우 1<br/>0~500자"]
+        W1 --> W2["윈도우 2<br/>450~950자"]
+        W2 --> W3["윈도우 3<br/>900~1400자"]
+        W3 --> W4["윈도우 4<br/>1350~1850자"]
+        W4 --> W5["윈도우 5<br/>1800~2000자"]
+    end
+
+    subgraph RESULT["결과"]
+        CHUNKS["5개 청크 생성<br/>오버랩으로 문맥 연결"]
+    end
+
+    CONFIG --> ALGORITHM
+    ALGORITHM --> RESULT
+
+    style CONFIG fill:#e3f2fd
+    style ALGORITHM fill:#fff3e0
+    style RESULT fill:#e8f5e9
+```
+
+#### 청킹 시각화 예시
+
+```
+원본 텍스트 (2000자):
+┌──────────────────────────────────────────────────────────────────────────┐
+│ AAAAA...AAAAA │ BBBBB...BBBBB │ CCCCC...CCCCC │ DDDDD...DDDDD │ EEEE...  │
+│    (500자)    │    (500자)    │    (500자)    │    (500자)    │          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+청킹 결과 (50자 오버랩):
+┌─────────────────────┐
+│ Chunk 0: AAAAA...   │  (0~500)
+│    └──────┐         │
+│           ▼         │
+│ Chunk 1: ..AAA+BBBB │  (450~950) ← 50자 오버랩
+│           └──────┐  │
+│                  ▼  │
+│ Chunk 2: ..BBB+CCCC │  (900~1400)
+│                  ...│
+└─────────────────────┘
+
+오버랩의 목적: 청크 경계에서 문맥이 끊기는 것을 방지
+```
+
+### 5.4 벡터 인덱싱 상세 (ChromaDB + bge-m3)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Application
+    participant VS as VectorStore
+    participant Ollama as Ollama API
+    participant BGE as bge-m3 모델
+    participant Chroma as ChromaDB
+
+    App->>VS: add_documents(chunks)
+
+    Note over VS: 청크 ID 생성<br/>["0", "1", "2", ...]
+
+    loop 각 청크에 대해
+        VS->>Ollama: POST /api/embeddings
+        Note over Ollama: model: "bge-m3"<br/>prompt: chunk_text
+
+        Ollama->>BGE: 텍스트 인코딩
+        BGE->>BGE: 토큰화
+        BGE->>BGE: Transformer 레이어 통과
+        BGE->>BGE: Pooling (평균)
+        BGE-->>Ollama: 768차원 벡터
+
+        Ollama-->>VS: {"embedding": [0.12, -0.34, ...]}
+
+        alt 임베딩 성공
+            VS->>VS: embeddings 리스트에 추가
+        else 임베딩 실패
+            VS->>VS: 더미 벡터 추가 [0.0] × 768
+        end
+    end
+
+    VS->>Chroma: collection.add()
+    Note over Chroma: documents: 원본 청크들<br/>embeddings: 벡터들<br/>ids: 청크 ID들
+
+    Chroma-->>VS: 저장 완료
+    VS-->>App: 인덱싱 완료
+```
+
+#### 벡터 저장 구조
+
+```mermaid
+flowchart TB
+    subgraph CHROMADB["ChromaDB Collection: 'docs'"]
+        direction TB
+
+        subgraph ROW0["Document 0"]
+            ID0["id: '0'"]
+            DOC0["document: '첫 번째 청크 텍스트...'"]
+            EMB0["embedding: [0.12, -0.34, 0.56, ...(768개)]"]
+        end
+
+        subgraph ROW1["Document 1"]
+            ID1["id: '1'"]
+            DOC1["document: '두 번째 청크 텍스트...'"]
+            EMB1["embedding: [0.23, 0.45, -0.67, ...(768개)]"]
+        end
+
+        subgraph ROW2["Document 2"]
+            ID2["id: '2'"]
+            DOC2["document: '세 번째 청크 텍스트...'"]
+            EMB2["embedding: [-0.11, 0.22, 0.33, ...(768개)]"]
+        end
+
+        MORE["... (N개 문서)"]
+    end
+
+    style CHROMADB fill:#f3e5f5
+```
+
+#### bge-m3 임베딩 모델 특성
+
+```mermaid
+flowchart LR
+    subgraph MODEL["bge-m3 모델"]
+        direction TB
+        MULTI["다국어 지원<br/>한국어, 영어, 중국어 등"]
+        DIM["출력 차원: 768"]
+        MAX["최대 입력: 8192 토큰"]
+    end
+
+    subgraph CAPABILITY["검색 능력"]
+        direction TB
+        SEM["의미적 유사성 파악<br/>'자동차' ≈ '차량'"]
+        CROSS["교차 언어 검색<br/>'car' ≈ '자동차'"]
+    end
+
+    MODEL --> CAPABILITY
+
+    style MODEL fill:#e3f2fd
+    style CAPABILITY fill:#e8f5e9
+```
+
+### 5.5 키워드 인덱싱 상세 (BM25)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Application
+    participant KS as KeywordStore
+    participant BM25 as BM25Okapi
+
+    App->>KS: add_documents(chunks)
+
+    KS->>KS: 원본 청크 저장<br/>self.chunks = chunks
+
+    Note over KS: 토큰화 (공백 기준)
+
+    loop 각 청크에 대해
+        KS->>KS: chunk.split(" ")
+        Note over KS: "제품 XG-200 사양"<br/>→ ["제품", "XG-200", "사양"]
+    end
+
+    KS->>KS: tokenized_corpus 생성
+    Note over KS: [["제품", "XG-200", "사양"],<br/> ["가격", "100만원", "입니다"],<br/> ...]
+
+    KS->>BM25: BM25Okapi(tokenized_corpus)
+
+    Note over BM25: 인덱스 구축:<br/>1. 문서 빈도(DF) 계산<br/>2. 역문서 빈도(IDF) 계산<br/>3. 평균 문서 길이 계산
+
+    BM25-->>KS: BM25 인덱스 객체
+    KS-->>App: 인덱싱 완료
+```
+
+#### BM25 인덱스 내부 구조
+
+```mermaid
+flowchart TD
+    subgraph BM25_INDEX["BM25 인덱스 구조"]
+        direction TB
+
+        subgraph CORPUS["토큰화된 코퍼스"]
+            D0["Doc 0: ['제품', 'XG-200', '사양', '안내']"]
+            D1["Doc 1: ['가격', '정보', 'XG-200', '모델']"]
+            D2["Doc 2: ['설치', '방법', '안내', '문서']"]
+        end
+
+        subgraph STATS["통계 정보"]
+            AVGDL["평균 문서 길이 (avgdl): 4.0"]
+            N["총 문서 수 (N): 3"]
+        end
+
+        subgraph IDF_TABLE["IDF 테이블"]
+            IDF1["'XG-200': IDF = log((3-2+0.5)/(2+0.5)) = 0.18"]
+            IDF2["'제품': IDF = log((3-1+0.5)/(1+0.5)) = 0.98"]
+            IDF3["'안내': IDF = log((3-2+0.5)/(2+0.5)) = 0.18"]
+        end
+    end
+
+    subgraph FORMULA["BM25 점수 공식"]
+        F["Score(D,Q) = Σ IDF(qi) × (f(qi,D) × (k1+1)) / (f(qi,D) + k1 × (1-b+b×|D|/avgdl))"]
+        NOTE["k1=1.5, b=0.75 (기본값)"]
+    end
+
+    BM25_INDEX --> FORMULA
+
+    style BM25_INDEX fill:#fff3e0
+    style FORMULA fill:#ffebee
+```
+
+#### BM25 vs 벡터 검색 비교
+
+```mermaid
+flowchart LR
+    subgraph QUERY["검색 쿼리: 'XG-200 가격'"]
+        Q["쿼리"]
+    end
+
+    subgraph BM25_SEARCH["BM25 (키워드)"]
+        direction TB
+        BM_TOK["토큰화: ['XG-200', '가격']"]
+        BM_MATCH["정확한 문자열 매칭"]
+        BM_RESULT["✓ 'XG-200' 포함 문서 우선<br/>✓ '가격' 포함 문서 우선"]
+        BM_WEAK["✗ '가격' ≠ '비용' (매칭 안됨)"]
+    end
+
+    subgraph VEC_SEARCH["벡터 (의미)"]
+        direction TB
+        VEC_EMB["임베딩: [0.23, -0.45, ...]"]
+        VEC_SIM["코사인 유사도 계산"]
+        VEC_RESULT["✓ '비용', '금액' 등 유사어 매칭"]
+        VEC_WEAK["✗ 'XG-200' 정확 매칭 약함"]
+    end
+
+    Q --> BM25_SEARCH
+    Q --> VEC_SEARCH
+
+    style BM25_SEARCH fill:#fff3e0
+    style VEC_SEARCH fill:#e3f2fd
+```
+
+### 5.6 인덱싱 성능 및 리소스
+
+```mermaid
+flowchart TB
+    subgraph PERF["인덱싱 성능 특성"]
+        direction LR
+
+        subgraph VECTOR_PERF["벡터 인덱싱"]
+            VP1["⏱️ 시간: 느림<br/>(API 호출 필요)"]
+            VP2["💾 메모리: 높음<br/>(768 × N floats)"]
+            VP3["🔄 실시간: 불가<br/>(배치 처리 권장)"]
+        end
+
+        subgraph KEYWORD_PERF["키워드 인덱싱"]
+            KP1["⏱️ 시간: 빠름<br/>(로컬 처리)"]
+            KP2["💾 메모리: 낮음<br/>(토큰 사전)"]
+            KP3["🔄 실시간: 가능<br/>(즉시 추가)"]
+        end
+    end
+
+    subgraph EXAMPLE["예시: 100개 청크"]
+        E1["벡터 인덱싱: ~30-60초<br/>(API 100회 호출)"]
+        E2["키워드 인덱싱: ~0.1초<br/>(로컬 토큰화)"]
+    end
+
+    PERF --> EXAMPLE
+
+    style VECTOR_PERF fill:#f3e5f5
+    style KEYWORD_PERF fill:#fff3e0
+```
+
+### 5.7 인덱싱 완료 후 데이터 구조
+
+```mermaid
+flowchart TB
+    subgraph MEMORY["메모리 내 데이터 구조"]
+        direction TB
+
+        subgraph VS_DATA["VectorStore"]
+            VS_CLIENT["ChromaDB Client<br/>(인메모리 모드)"]
+            VS_COLL["Collection: 'docs'"]
+            VS_DOCS["documents: [chunk0, chunk1, ...]"]
+            VS_EMBS["embeddings: [[768 floats], ...]"]
+            VS_IDS["ids: ['0', '1', '2', ...]"]
+        end
+
+        subgraph KS_DATA["KeywordStore"]
+            KS_CHUNKS["chunks: [chunk0, chunk1, ...]"]
+            KS_BM25["bm25: BM25Okapi 객체"]
+            KS_CORPUS["내부 corpus: [[tokens], ...]"]
+            KS_IDF["내부 idf: {term: score}"]
+        end
+    end
+
+    subgraph READY["검색 준비 완료"]
+        R1["벡터 검색: VectorStore.search()"]
+        R2["키워드 검색: KeywordStore.search()"]
+        R3["하이브리드: 둘 다 사용"]
+    end
+
+    VS_DATA --> R1
+    KS_DATA --> R2
+    VS_DATA --> R3
+    KS_DATA --> R3
+
+    style VS_DATA fill:#f3e5f5
+    style KS_DATA fill:#fff3e0
+    style READY fill:#e8f5e9
+```
+
+---
+
+## 6. 검색 모드별 흐름도
+
+### 6.1 벡터 검색 (Semantic Search) 상세
 
 ```mermaid
 flowchart TD
@@ -428,7 +857,7 @@ flowchart TD
     style OUTPUT fill:#ffebee
 ```
 
-### 5.2 키워드 검색 (BM25) 상세
+### 6.2 키워드 검색 (BM25) 상세
 
 ```mermaid
 flowchart TD
@@ -467,7 +896,7 @@ flowchart TD
     style RANK fill:#e8f5e9
 ```
 
-### 5.3 하이브리드 검색 + 리랭킹 상세
+### 6.3 하이브리드 검색 + 리랭킹 상세
 
 ```mermaid
 flowchart TD
@@ -515,7 +944,7 @@ flowchart TD
     style RERANK fill:#fff8e1
 ```
 
-### 5.4 검색 모드 비교
+### 6.4 검색 모드 비교
 
 ```mermaid
 flowchart LR
@@ -555,9 +984,9 @@ flowchart LR
 
 ---
 
-## 6. 클래스 다이어그램
+## 7. 클래스 다이어그램
 
-### 6.1 Advanced RAG Bot 클래스 구조
+### 7.1 Advanced RAG Bot 클래스 구조
 
 ```mermaid
 classDiagram
@@ -621,7 +1050,7 @@ classDiagram
     DocumentLoader ..> KeywordStore : 청크 제공
 ```
 
-### 6.2 컴포넌트 관계도
+### 7.2 컴포넌트 관계도
 
 ```mermaid
 flowchart TB
@@ -679,9 +1108,9 @@ flowchart TB
 
 ---
 
-## 7. 데이터 흐름
+## 8. 데이터 흐름
 
-### 7.1 문서 처리 파이프라인
+### 8.1 문서 처리 파이프라인
 
 ```mermaid
 flowchart LR
@@ -715,7 +1144,7 @@ flowchart LR
     style INDEXING fill:#f3e5f5
 ```
 
-### 7.2 쿼리 처리 파이프라인
+### 8.2 쿼리 처리 파이프라인
 
 ```mermaid
 flowchart TD
@@ -760,7 +1189,7 @@ flowchart TD
     style OUTPUT fill:#4caf50,color:#fff
 ```
 
-### 7.3 임베딩 생성 흐름
+### 8.3 임베딩 생성 흐름
 
 ```mermaid
 flowchart LR
@@ -785,9 +1214,9 @@ flowchart LR
 
 ---
 
-## 8. 외부 의존성
+## 9. 외부 의존성
 
-### 8.1 의존성 구조도
+### 9.1 의존성 구조도
 
 ```mermaid
 flowchart TB
@@ -830,7 +1259,7 @@ flowchart TB
     style MODELS fill:#ffebee
 ```
 
-### 8.2 API 호출 시퀀스
+### 9.2 API 호출 시퀀스
 
 ```mermaid
 sequenceDiagram
