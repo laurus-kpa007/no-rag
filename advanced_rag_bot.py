@@ -14,20 +14,25 @@ from chromadb.utils import embedding_functions
 # ==========================================
 class Config:
     DOC_PATH = 'data.docx'
-    
+
     # Ollama 서버 설정 (필요시 수정)
     OLLAMA_HOST = 'http://localhost:11434'
-    
+
     # 모델 설정
     MODEL_CHAT = 'gemma3:12b'      # 답변 생성용 LLM
     MODEL_EMBED = 'bge-m3' # 임베딩용 모델 (없으면 'ollama pull nomic-embed-text')
     MODEL_RERANK = 'gemma3:12b'    # 리랭킹용 LLM (가벼운 모델 권장)
-    
+
     # 검색 설정
     CHUNK_SIZE = 500              # 청크 크기 (글자 수)
     CHUNK_OVERLAP = 50            # 청크 겹침 크기
     TOP_K = 5                     # 검색시 가져올 문서 수
     NUM_CTX = 32768               # LLM 컨텍스트 윈도우
+
+# Ollama 클라이언트 (원격 호스트 지원)
+def get_ollama_client():
+    """OLLAMA_HOST 설정을 사용하는 클라이언트 반환"""
+    return ollama.Client(host=Config.OLLAMA_HOST)
 
 # ==========================================
 # 2. 문서 로더 & 청킹 (Loader & Chunking)
@@ -107,10 +112,10 @@ class VectorStore:
         # Ollama를 통해 임베딩 생성
         embeddings = []
         print("   [Vector] 임베딩 생성 중... (시간이 걸릴 수 있습니다)")
+        client = get_ollama_client()  # 원격 호스트 지원
         for chunk in chunks:
             try:
-                # ollama.embeddings 사용
-                res = ollama.embeddings(model=Config.MODEL_EMBED, prompt=chunk)
+                res = client.embeddings(model=Config.MODEL_EMBED, prompt=chunk)
                 embeddings.append(res['embedding'])
             except Exception as e:
                 print(f"   [Error] 임베딩 생성 실패: {e}")
@@ -125,7 +130,8 @@ class VectorStore:
 
     def search(self, query, top_k=5):
         # 쿼리 임베딩
-        res = ollama.embeddings(model=Config.MODEL_EMBED, prompt=query)
+        client = get_ollama_client()  # 원격 호스트 지원
+        res = client.embeddings(model=Config.MODEL_EMBED, prompt=query)
         query_embedding = res['embedding']
         
         results = self.collection.query(
@@ -182,7 +188,8 @@ def correct_query(query, context_chunks=None):
 {query}
 """
     try:
-        res = ollama.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+        client = get_ollama_client()  # 원격 호스트 지원
+        res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
         corrected = res['message']['content'].strip()
         return corrected.replace('"', '').replace("'", "")
     except:
@@ -194,7 +201,8 @@ def rerank_documents(query, docs):
     """
     print("   [Rerank] 문서 재순위 지정 중(LLM)...")
     scored_docs = []
-    
+    client = get_ollama_client()  # 원격 호스트 지원
+
     for doc in docs:
         prompt = f"""
 당신은 검색 품질 관리자입니다.
@@ -210,7 +218,7 @@ def rerank_documents(query, docs):
 설명은 하지 마세요.
 """
         try:
-            res = ollama.chat(model=Config.MODEL_RERANK, messages=[{'role': 'user', 'content': prompt}])
+            res = client.chat(model=Config.MODEL_RERANK, messages=[{'role': 'user', 'content': prompt}])
             content = res['message']['content'].strip().lower()
             score = 1 if 'yes' in content else 0
             if score == 1:
