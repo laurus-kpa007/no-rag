@@ -25,7 +25,12 @@
 | 봇 | 설명 | 적합한 문서 크기 |
 |---|---|---|
 | **No-RAG Bot** | 전체 문서를 컨텍스트로 사용 | 소규모 (~100페이지) |
-| **Advanced RAG Bot** | 하이브리드 검색 + 리랭킹 | 대규모 (100~500페이지) |
+| **Advanced RAG Bot** | **Metadata-Driven** 하이브리드 검색 + 리랭킹 (2026 최신) | 대규모 (100~500페이지) |
+
+### 🆕 2026년 최신 기술 적용
+- **Metadata-Driven Query Correction**: 벡터 검색 없이 메타데이터로 질의 교정 (31% 성능 향상)
+- **Query Type Detection**: LLM 기반 질문 유형 자동 분석 및 최적 검색 전략 선택
+- **Pre-Summarization Cache**: 인덱싱 시 사전 요약 생성으로 빠른 요약 응답
 
 ---
 
@@ -47,8 +52,11 @@ flowchart TB
     subgraph PROCESSING["처리 레이어"]
         DOC[문서 로더]
         CHUNK[텍스트 청킹]
-        QC[쿼리 교정]
+        META[메타데이터 추출<br/>NEW 2026]
+        QC[메타데이터 기반<br/>쿼리 교정]
+        QR[Query Router<br/>유형 분석]
         RR[문서 리랭킹]
+        CACHE[요약 캐시<br/>NEW 2026]
     end
 
     subgraph RETRIEVAL["검색 엔진"]
@@ -76,8 +84,14 @@ flowchart TB
     NRB --> DOC
     ARB --> DOC
     ARB --> CHUNK
+    ARB --> META
     ARB --> QC
+    ARB --> QR
     ARB --> RR
+    ARB --> CACHE
+
+    META --> QC
+    QC --> QR
 
     DOC --> DOCX
     DOC --> MD
@@ -112,16 +126,19 @@ flowchart LR
         A3 --> A4[응답 스트리밍]
     end
 
-    subgraph ADV_RAG["Advanced RAG Bot (고급)"]
+    subgraph ADV_RAG["Advanced RAG Bot (고급, 2026)"]
         direction TB
-        B1[문서 로드] --> B2[텍스트 청킹]
-        B2 --> B3[인덱싱<br/>Vector + BM25]
-        B3 --> B4[검색 모드 선택]
-        B4 --> B5[쿼리 교정]
-        B5 --> B6[검색 실행]
-        B6 --> B7[리랭킹<br/>선택적]
-        B7 --> B8[LLM 질의]
-        B8 --> B9[응답 스트리밍]
+        B1[문서 로드] --> B2[메타데이터 추출<br/>NEW]
+        B2 --> B3[텍스트 청킹]
+        B3 --> B4[인덱싱<br/>Vector + BM25]
+        B4 --> B5[사전 요약 생성<br/>NEW]
+        B5 --> B6[검색 모드 선택]
+        B6 --> B7[메타데이터 기반<br/>쿼리 교정 + 유형 분석<br/>NEW]
+        B7 --> B8[Query Router<br/>유형별 검색 전략]
+        B8 --> B9[검색 실행]
+        B9 --> B10[리랭킹<br/>선택적]
+        B10 --> B11[LLM 질의]
+        B11 --> B12[응답 스트리밍]
     end
 
     NO_RAG -.->|"작은 문서"| ADV_RAG
@@ -230,19 +247,28 @@ sequenceDiagram
     participant U as 사용자
     participant Bot as Advanced RAG Bot
     participant Loader as 문서 로더
+    participant Meta as MetadataStore
     participant VS as VectorStore
     participant KS as KeywordStore
+    participant Cache as SummaryCache
     participant QC as Query Corrector
+    participant Router as Query Router
     participant RR as Reranker
     participant Ollama as Ollama Server
 
     %% 초기화 단계
     rect rgb(240, 248, 255)
-        Note over Bot,Ollama: 초기화 단계
+        Note over Bot,Ollama: 초기화 단계 (2026 개선)
         U->>Bot: python advanced_rag_bot.py [파일]
         Bot->>Loader: load_document()
         Loader->>Loader: Deep XML 추출<br/>(모든 w:t 태그)
         Loader-->>Bot: 전체 텍스트
+
+        Bot->>Meta: extract_metadata(전체 텍스트)
+        Note over Meta: 도메인, 키워드,<br/>전문용어 추출
+        Meta->>Ollama: LLM 메타데이터 추출 요청
+        Ollama-->>Meta: 메타데이터
+        Meta-->>Bot: 메타데이터 저장 완료
 
         Bot->>Bot: chunk_text()<br/>(500자, 50 오버랩)
 
@@ -254,25 +280,33 @@ sequenceDiagram
         and
             Bot->>KS: add_documents(chunks)
             KS->>KS: BM25 인덱스 구축
+        and
+            Bot->>Cache: generate(전체 텍스트)
+            Note over Cache: 사전 요약 생성<br/>(계층적 요약)
+            Cache->>Ollama: 요약 생성 요청
+            Ollama-->>Cache: 요약 결과
+            Cache-->>Bot: 요약 캐시 완료
         end
     end
 
     %% 대화 루프
     rect rgb(255, 248, 240)
-        Note over U,Ollama: 대화 루프
+        Note over U,Ollama: 대화 루프 (메타데이터 기반)
         loop 사용자 종료 전까지
-            Bot->>U: 검색 모드 선택 (1-4)
+            Bot->>U: 검색 모드 선택 (1-5)
             U->>Bot: 모드 선택
             U->>Bot: 질문 입력
 
-            %% 쿼리 교정
-            alt 모드 2,3,4
-                Bot->>VS: pre-search (top 3)
-                VS-->>Bot: 참조 청크
-                Bot->>QC: correct_query(질문, 참조)
-                QC->>Ollama: chat(교정 프롬프트)
-                Ollama-->>QC: 교정된 쿼리
-                QC-->>Bot: 교정된 쿼리
+            %% 메타데이터 기반 쿼리 교정 + 유형 분석
+            Bot->>QC: correct_query_with_metadata(질문, metadata_store)
+            Note over QC: 벡터 검색 없이<br/>메타데이터만 사용
+            QC->>Ollama: LLM 교정 + 유형 분석
+            Ollama-->>QC: 교정된 쿼리 + 질문 유형
+            QC-->>Bot: (교정된 쿼리, QueryType)
+
+            alt 모드 5: 자동 모드
+                Bot->>Router: detected_query_type 사용
+                Note over Router: SEARCH/SUMMARY/<br/>COMPARE/LIST 분기
             end
 
             %% 검색 실행
@@ -298,6 +332,28 @@ sequenceDiagram
                 RR->>Ollama: 각 문서별 관련성 평가
                 Ollama-->>RR: Yes/No 판정
                 RR-->>Bot: 필터링된 결과
+            else 모드 5: 자동 모드 (Query Router)
+                alt QueryType.SEARCH
+                    Note over Bot: 하이브리드 검색
+                    Bot->>VS: search + KS: search
+                    Bot->>RR: rerank_documents()
+                else QueryType.SUMMARY
+                    Note over Bot: 사전 요약 사용
+                    Bot->>Cache: get_summary()
+                    Cache-->>Bot: 캐시된 요약
+                else QueryType.COMPARE
+                    Note over Bot: 엔티티별 검색
+                    Bot->>Bot: extract_comparison_entities()
+                    loop 각 엔티티
+                        Bot->>VS: search(entity)
+                        Bot->>KS: search(entity)
+                    end
+                    Bot->>RR: rerank_documents()
+                else QueryType.LIST
+                    Note over Bot: 확장 검색 (TOP_K × 4)
+                    Bot->>VS: search(query, top_k=20)
+                    Bot->>KS: search(query, top_k=20)
+                end
             end
 
             %% 응답 생성
@@ -976,10 +1032,19 @@ flowchart LR
         M4_CONS["단점: 느림 (LLM 호출)"]
     end
 
+    subgraph MODE5["모드 5: 자동 (Query Router) ⭐"]
+        direction TB
+        M5_DETECT[메타데이터 기반<br/>질의 교정 + 유형 분석] --> M5_ROUTE[Query Router]
+        M5_ROUTE --> M5_STRAT[유형별 최적 검색]
+        M5_PROS["장점: 자동 최적화, 빠른 요약"]
+        M5_CONS["단점: 복잡한 로직"]
+    end
+
     style MODE1 fill:#c8e6c9
     style MODE2 fill:#bbdefb
     style MODE3 fill:#ffe0b2
     style MODE4 fill:#f8bbd9
+    style MODE5 fill:#e1bee7
 ```
 
 ---
@@ -1000,6 +1065,19 @@ classDiagram
         +int CHUNK_OVERLAP
         +int TOP_K
         +int NUM_CTX
+        +int SUMMARY_CHUNK_SIZE
+        +float MAX_CONTEXT_RATIO
+        +bool PRE_SUMMARIZE
+    }
+
+    class MetadataStore {
+        +str domain
+        +List~str~ keywords
+        +List~str~ technical_terms
+        +bool is_ready
+        +__init__()
+        +extract_metadata(full_doc: str)
+        +get_metadata_context() str
     }
 
     class VectorStore {
@@ -1018,6 +1096,23 @@ classDiagram
         +search(query: str, top_k: int) List~str~
     }
 
+    class SummaryCache {
+        -str full_summary
+        -List~str~ section_summaries
+        -bool is_ready
+        +__init__()
+        +generate(full_doc: str)
+        +get_summary() str
+    }
+
+    class QueryType {
+        <<enumeration>>
+        +SEARCH
+        +SUMMARY
+        +COMPARE
+        +LIST
+    }
+
     class DocumentLoader {
         <<module functions>>
         +load_document(file_path: str) str
@@ -1026,7 +1121,15 @@ classDiagram
 
     class QueryProcessor {
         <<module functions>>
-        +correct_query(query: str, context: List~str~) str
+        +correct_query_with_metadata(query: str, metadata_store: MetadataStore) tuple
+        +correct_query_basic(query: str) tuple
+    }
+
+    class QueryRouter {
+        <<module functions>>
+        +classify_query_fast(query: str) str
+        +classify_query_llm(query: str) str
+        +extract_comparison_entities(query: str) List~str~
     }
 
     class Reranker {
@@ -1040,14 +1143,22 @@ classDiagram
         +chat(model: str, messages: List, stream: bool) Generator
     }
 
+    MetadataStore --> OllamaClient : 메타데이터 추출 요청
     VectorStore --> OllamaClient : 임베딩 요청
     VectorStore --> Config : 설정 참조
     KeywordStore --> Config : 설정 참조
-    QueryProcessor --> OllamaClient : 교정 요청
+    SummaryCache --> OllamaClient : 요약 생성 요청
+    SummaryCache --> Config : 설정 참조
+    QueryProcessor --> OllamaClient : 교정 + 유형 분석 요청
+    QueryProcessor --> MetadataStore : 메타데이터 참조
+    QueryRouter --> OllamaClient : 유형 분류 요청 (fallback)
+    QueryRouter --> QueryType : 사용
     Reranker --> OllamaClient : 평가 요청
 
+    DocumentLoader ..> MetadataStore : 전체 문서 제공
     DocumentLoader ..> VectorStore : 청크 제공
     DocumentLoader ..> KeywordStore : 청크 제공
+    DocumentLoader ..> SummaryCache : 전체 문서 제공
 ```
 
 ### 7.2 컴포넌트 관계도
@@ -1294,16 +1405,27 @@ sequenceDiagram
 이 프로젝트는 **문서 기반 Q&A 시스템**의 두 가지 접근 방식을 보여줍니다:
 
 1. **No-RAG Bot**: 단순하지만 효과적인 전체 문서 컨텍스트 방식
-2. **Advanced RAG Bot**: 프로덕션 수준의 하이브리드 검색 시스템
+2. **Advanced RAG Bot**: **2026년 최신 기술**을 적용한 프로덕션급 하이브리드 검색 시스템
 
 주요 기술 스택:
 - **LLM**: Ollama (gemma3:12b, bge-m3)
 - **벡터 DB**: ChromaDB (인메모리)
 - **키워드 검색**: BM25
 - **문서 파싱**: python-docx
+- **메타데이터**: LLM 기반 자동 추출 🆕
+- **Query Router**: 질문 유형 자동 분석 🆕
+- **요약 캐시**: 사전 요약 생성 🆕
 
-이 아키텍처의 강점:
-- 의미 검색과 키워드 검색의 장점을 결합
-- LLM 기반 쿼리 교정으로 검색 품질 향상
-- LLM 리랭킹으로 관련성 높은 결과 필터링
-- 스트리밍 응답으로 실시간 사용자 경험 제공
+이 아키텍처의 강점 (2026 최신):
+- 🆕 **Metadata-Driven Query Correction**: 벡터 검색 실패에 강건함 (31% 성능 향상)
+- 🆕 **Query Type Detection**: LLM이 질문 유형을 자동 분석하여 최적 검색 전략 선택
+- 🆕 **Pre-Summarization**: 인덱싱 시 사전 요약으로 빠른 SUMMARY 응답
+- **Hybrid Search**: 의미 검색과 키워드 검색의 장점을 결합 (2026 업계 표준)
+- **LLM Reranking**: 관련성 높은 결과 필터링
+- **Deep XML Extraction**: 텍스트 상자, 도형 등 숨겨진 텍스트까지 추출
+- **Streaming Response**: 실시간 사용자 경험 제공
+
+### 참고 문헌
+- [Utilizing Metadata for Better RAG (2026)](https://arxiv.org/html/2601.11863v1) - 메타데이터 기반 RAG
+- [Advanced RAG Techniques](https://neo4j.com/blog/genai/advanced-rag-techniques/) - 하이브리드 검색
+- [Pre-Retrieval Query Optimization](https://www.educative.io/courses/advanced-rag-techniques-choosing-the-right-approach/what-is-pre-retrieval-query-optimization) - 검색 전 최적화

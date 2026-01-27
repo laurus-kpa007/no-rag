@@ -101,7 +101,86 @@ def chunk_text(text, size, overlap):
     return chunks
 
 # ==========================================
-# 3. 검색 엔진 (Retrievers)
+# 3. 메타데이터 저장소 (Metadata Store)
+# ==========================================
+class MetadataStore:
+    """
+    문서 인덱싱 시 추출한 메타데이터를 저장합니다.
+    - 도메인/주제
+    - 주요 키워드
+    - 전문 용어
+    """
+    def __init__(self):
+        self.domain = ""
+        self.keywords = []
+        self.technical_terms = []
+        self.is_ready = False
+
+    def extract_metadata(self, full_doc):
+        """
+        문서 전체에서 메타데이터를 추출합니다.
+        """
+        print("\n[Metadata] 문서 메타데이터 추출 중...")
+
+        # 문서가 너무 크면 앞부분만 샘플링
+        sample = full_doc[:3000] if len(full_doc) > 3000 else full_doc
+
+        prompt = f"""다음 문서를 분석하여 메타데이터를 추출하세요.
+
+[문서 샘플]
+{sample}
+
+다음 형식으로만 출력하세요:
+도메인: [문서의 주제/분야를 한 문장으로]
+키워드: [중요 키워드 5-10개, 쉼표로 구분]
+전문용어: [전문 용어/고유명사 5-10개, 쉼표로 구분]
+
+예시:
+도메인: 의료기기 제품 사양서
+키워드: 출력, 전압, 전류, 정격, 안전규격, 인증
+전문용어: XG-200, CE마크, IEC60601, 절연저항, 누설전류"""
+
+        try:
+            client = get_ollama_client()
+            res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+            content = res['message']['content'].strip()
+
+            # 파싱
+            for line in content.split('\n'):
+                if line.startswith('도메인:'):
+                    self.domain = line.replace('도메인:', '').strip()
+                elif line.startswith('키워드:'):
+                    keywords_str = line.replace('키워드:', '').strip()
+                    self.keywords = [k.strip() for k in keywords_str.split(',')]
+                elif line.startswith('전문용어:'):
+                    terms_str = line.replace('전문용어:', '').strip()
+                    self.technical_terms = [t.strip() for t in terms_str.split(',')]
+
+            self.is_ready = True
+            print(f"[Metadata] 추출 완료")
+            print(f"   도메인: {self.domain}")
+            print(f"   키워드: {', '.join(self.keywords[:5])}...")
+            print(f"   전문용어: {', '.join(self.technical_terms[:5])}...")
+
+        except Exception as e:
+            print(f"[Metadata] 추출 실패: {e}")
+            self.is_ready = False
+
+    def get_metadata_context(self):
+        """
+        질의 교정에 사용할 메타데이터 컨텍스트를 반환합니다.
+        """
+        if not self.is_ready:
+            return ""
+
+        context = f"""[문서 메타데이터]
+도메인: {self.domain}
+주요 키워드: {', '.join(self.keywords)}
+전문 용어: {', '.join(self.technical_terms)}"""
+        return context
+
+# ==========================================
+# 4. 검색 엔진 (Retrievers)
 # ==========================================
 class VectorStore:
     def __init__(self):
@@ -167,38 +246,123 @@ class KeywordStore:
         return [self.chunks[i] for i in top_n_indexes]
 
 # ==========================================
-# 4. Reranker & Query Refiner (LLM 기반)
+# 5. Reranker & Query Refiner (LLM 기반)
 # ==========================================
-def correct_query(query, context_chunks=None):
+def correct_query_with_metadata(query, metadata_store):
     """
-    사용자 질문의 오타와 띄어쓰기를 교정합니다. (문맥 인식)
+    메타데이터를 사용하여 사용자 질문의 오타와 띄어쓰기를 교정하고,
+    질문 유형도 함께 분석합니다.
+
+    Returns:
+        tuple: (corrected_query, query_type)
     """
-    context_instruction = ""
-    if context_chunks:
-        snippets = "\n".join([c[:200] + "..." for c in context_chunks])
-        context_instruction = f"""
-[참고 문서 내용]
-{snippets}
+    if not metadata_store.is_ready:
+        # 메타데이터가 없으면 기본 교정
+        return correct_query_basic(query)
 
-위 [참고 문서 내용]에 등장하는 전문 용어나 표현을 우선적으로 사용하여 교정하세요.
-"""
+    metadata_context = metadata_store.get_metadata_context()
 
-    prompt = f"""
-당신은 문법 및 용어 교정기입니다. 
-아래 [질문]의 오타와 띄어쓰기를 교정하세요.
-{context_instruction}
-설명 없이 수정된 문장만 출력하세요.
+    prompt = f"""당신은 질문 분석 전문가입니다. 다음 작업을 수행하세요:
+
+1. [질문]의 오타와 띄어쓰기를 교정
+2. [질문]의 유형을 분류
+
+{metadata_context}
+
+위 메타데이터의 전문 용어나 키워드를 우선 사용하여 교정하세요.
+
+질문 유형 분류 기준:
+- SEARCH: 특정 정보를 찾는 질문 (예: "재택근무 승인은?", "XG-200 출력은?", "가격은?", "주의할 점은?")
+- SUMMARY: 문서 전체/전반적인 내용 요약 요청 (예: "문서 요약해줘", "전체 내용 정리", "이 문서가 뭔 내용이야?")
+- COMPARE: 비교/대조 요청 (예: "A와 B 차이점", "장단점 비교")
+- LIST: 모든 항목 나열 요청 (예: "모든 제품 목록", "전체 종류", "모든 기능")
 
 [질문]
 {query}
+
+다음 형식으로만 출력하세요:
+교정된질문: [교정된 질문]
+유형: [SEARCH/SUMMARY/COMPARE/LIST]
+
+예시:
+교정된질문: 재택근무 승인 절차는?
+유형: SEARCH
 """
     try:
-        client = get_ollama_client()  # 원격 호스트 지원
+        client = get_ollama_client()
         res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
-        corrected = res['message']['content'].strip()
-        return corrected.replace('"', '').replace("'", "")
+        content = res['message']['content'].strip()
+
+        # 파싱
+        corrected = query
+        query_type = QueryType.SEARCH  # 기본값
+
+        for line in content.split('\n'):
+            if line.startswith('교정된질문:'):
+                corrected = line.replace('교정된질문:', '').strip()
+                corrected = corrected.replace('"', '').replace("'", "")
+            elif line.startswith('유형:'):
+                type_str = line.replace('유형:', '').strip().upper()
+                if type_str in [QueryType.SEARCH, QueryType.SUMMARY, QueryType.COMPARE, QueryType.LIST]:
+                    query_type = type_str
+                # 혹시 유형이 문장에 포함되어 있을 경우
+                elif QueryType.SUMMARY in type_str:
+                    query_type = QueryType.SUMMARY
+                elif QueryType.COMPARE in type_str:
+                    query_type = QueryType.COMPARE
+                elif QueryType.LIST in type_str:
+                    query_type = QueryType.LIST
+
+        return corrected, query_type
     except:
-        return query
+        return query, QueryType.SEARCH
+
+def correct_query_basic(query):
+    """
+    기본 질의 교정 (메타데이터 없이)
+
+    Returns:
+        tuple: (corrected_query, query_type)
+    """
+    prompt = f"""당신은 질문 분석 전문가입니다. 다음 작업을 수행하세요:
+
+1. [질문]의 오타와 띄어쓰기를 교정
+2. [질문]의 유형을 분류
+
+질문 유형 분류 기준:
+- SEARCH: 특정 정보를 찾는 질문 (예: "재택근무 승인은?", "XG-200 출력은?", "가격은?", "주의할 점은?")
+- SUMMARY: 문서 전체/전반적인 내용 요약 요청 (예: "문서 요약해줘", "전체 내용 정리", "이 문서가 뭔 내용이야?")
+- COMPARE: 비교/대조 요청 (예: "A와 B 차이점", "장단점 비교")
+- LIST: 모든 항목 나열 요청 (예: "모든 제품 목록", "전체 종류", "모든 기능")
+
+[질문]
+{query}
+
+다음 형식으로만 출력하세요:
+교정된질문: [교정된 질문]
+유형: [SEARCH/SUMMARY/COMPARE/LIST]
+"""
+    try:
+        client = get_ollama_client()
+        res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+        content = res['message']['content'].strip()
+
+        # 파싱
+        corrected = query
+        query_type = QueryType.SEARCH
+
+        for line in content.split('\n'):
+            if line.startswith('교정된질문:'):
+                corrected = line.replace('교정된질문:', '').strip()
+                corrected = corrected.replace('"', '').replace("'", "")
+            elif line.startswith('유형:'):
+                type_str = line.replace('유형:', '').strip().upper()
+                if type_str in [QueryType.SEARCH, QueryType.SUMMARY, QueryType.COMPARE, QueryType.LIST]:
+                    query_type = type_str
+
+        return corrected, query_type
+    except:
+        return query, QueryType.SEARCH
 
 def rerank_documents(query, docs):
     """
@@ -244,25 +408,21 @@ class QueryType:
     COMPARE = "COMPARE"     # 비교/대조
     LIST = "LIST"           # 목록/나열
 
-# 키워드 기반 빠른 분류
+# 키워드 기반 빠른 분류 (더 엄격하게 조정)
 QUERY_PATTERNS = {
     QueryType.SUMMARY: [
-        # 요약/개요 요청
-        "요약", "정리", "개요", "전체", "전반", "대략", "간단히", "핵심",
-        "summarize", "summary", "overview", "briefly", "overall", "gist",
-        "뭔 내용", "무슨 내용", "어떤 내용", "내용이 뭐", "알려줘 전체",
-        # 매뉴얼/가이드 요청 (전체 절차를 원함)
-        "매뉴얼", "메뉴얼", "가이드", "안내", "절차", "프로세스", "순서",
-        "어떻게 해", "어떻게 하", "방법 알려", "방법을 알려", "전체 과정",
-        "manual", "guide", "process", "procedure", "how to", "step by step",
+        # 명확한 요약/개요 요청만
+        "요약해", "요약해줘", "정리해", "정리해줘", "개요", "전체 내용", "전반적",
+        "summarize", "summary", "overview", "전체적으로",
+        "뭔 내용", "무슨 내용", "내용이 뭐", "문서 전체",
     ],
     QueryType.LIST: [
-        "모든", "전부", "목록", "리스트", "나열", "종류", "몇 가지", "몇가지",
-        "all", "list", "every", "types", "종류별", "항목",
+        "모든", "전부", "목록", "리스트", "나열해", "종류 전부", "몇 가지",
+        "all", "list", "every", "모두", "전체 종류",
     ],
     QueryType.COMPARE: [
         "비교", "차이", "vs", "versus", "장단점", "다른점", "공통점",
-        "compare", "difference", "pros and cons", "versus", "differ",
+        "compare", "difference", "pros and cons",
     ],
 }
 
@@ -478,15 +638,19 @@ def main():
     chunks = chunk_text(text, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
     print(f"[System] 총 {len(chunks)}개의 청크 생성됨.")
 
-    # 2. 인덱싱 (초기화)
+    # 2. 메타데이터 추출
+    metadata_store = MetadataStore()
+    metadata_store.extract_metadata(text)
+
+    # 3. 인덱싱 (초기화)
     vector_store = VectorStore()
     keyword_store = KeywordStore()
-    
+
     # 두 스토어 모두에 데이터 주입
     vector_store.add_documents(chunks)
     keyword_store.add_documents(chunks)
 
-    # 3. 사전 요약 생성 (선택적)
+    # 4. 사전 요약 생성 (선택적)
     summary_cache = SummaryCache()
     if Config.PRE_SUMMARIZE:
         summary_cache.generate(text)
@@ -504,27 +668,20 @@ def main():
         print("="*40)
 
         mode = input("검색 모드를 선택하세요 (1-5): ").strip()
-        if mode.lower() in ['q', 'exit']: break
+        if mode.lower() in ['q', 'exit', 'ㅂ']: break
         
         original_query = input("\n질문: ").strip()
         if not original_query: continue
 
-        # 문맥 기반 질문 교정
-        print("   [Query] 오타 및 용어 교정 중... (문맥 파악)")
-        try:
-            # 1. 벡터 검색으로 관련 문맥(청크)를 먼저 가져옴 (오타에 강함)
-            # 전체 검색 모드(1번)일 때는 굳이 안 해도 되지만, 정확도를 위해 수행
-            pre_search_docs = vector_store.search(original_query, top_k=3)
-        except Exception as e:
-            print(f"   [Warning] 문맥 파악 실패: {e}")
-            pre_search_docs = []
-            
-        query = correct_query(original_query, context_chunks=pre_search_docs)
-        
+        # 메타데이터 기반 질문 교정 및 유형 분석 (벡터 검색 없이)
+        print("   [Query] 질문 분석 중... (교정 + 유형 판단)")
+        query, detected_query_type = correct_query_with_metadata(original_query, metadata_store)
+
         if query != original_query:
             print(f"   => 교정된 질문: {query}")
         else:
-             print(f"   => 질문: {query}")
+            print(f"   => 질문: {query}")
+        print(f"   => 질문 유형: {detected_query_type}")
 
         context = ""
         
@@ -558,17 +715,9 @@ def main():
 
         elif mode == '5':
             # === 자동 모드 (Query Router) ===
-            print("   [Router] 질문 유형 분석 중...")
-
-            # 1. 질문 유형 분류 (빠른 키워드 분류 먼저, 불확실하면 LLM)
-            query_type = classify_query_fast(query)
-
-            # 키워드로 SEARCH로 분류되었지만, LLM으로 재확인 (선택적)
-            if query_type == QueryType.SEARCH:
-                # 더 정확한 분류가 필요하면 LLM 사용 (비용 vs 정확도 트레이드오프)
-                query_type = classify_query_llm(query)
-
-            print(f"   [Router] 질문 유형: {query_type}")
+            # 이미 질의 교정 단계에서 LLM이 유형을 판단했으므로 그것을 사용
+            query_type = detected_query_type
+            print(f"   [Router] LLM이 분석한 질문 유형 사용: {query_type}")
 
             # 2. 유형별 처리
             if query_type == QueryType.SUMMARY:
