@@ -32,6 +32,7 @@ class Config:
     # Query Router 설정
     SUMMARY_CHUNK_SIZE = 3000     # 계층적 요약 시 청크 크기
     MAX_CONTEXT_RATIO = 0.7       # 전체 문서 투입 가능 비율 (NUM_CTX 대비)
+    PRE_SUMMARIZE = True          # 인덱싱 시 사전 요약 생성 여부
 
 # Ollama 클라이언트 (원격 호스트 지원)
 def get_ollama_client():
@@ -246,9 +247,14 @@ class QueryType:
 # 키워드 기반 빠른 분류
 QUERY_PATTERNS = {
     QueryType.SUMMARY: [
+        # 요약/개요 요청
         "요약", "정리", "개요", "전체", "전반", "대략", "간단히", "핵심",
         "summarize", "summary", "overview", "briefly", "overall", "gist",
         "뭔 내용", "무슨 내용", "어떤 내용", "내용이 뭐", "알려줘 전체",
+        # 매뉴얼/가이드 요청 (전체 절차를 원함)
+        "매뉴얼", "메뉴얼", "가이드", "안내", "절차", "프로세스", "순서",
+        "어떻게 해", "어떻게 하", "방법 알려", "방법을 알려", "전체 과정",
+        "manual", "guide", "process", "procedure", "how to", "step by step",
     ],
     QueryType.LIST: [
         "모든", "전부", "목록", "리스트", "나열", "종류", "몇 가지", "몇가지",
@@ -281,8 +287,8 @@ def classify_query_llm(query):
 질문: {query}
 
 유형:
-- SEARCH: 특정 정보를 찾는 질문 (예: "XG-200 출력은?", "설치 방법 알려줘", "A가 뭐야?")
-- SUMMARY: 전체 요약, 개요 요청 (예: "문서 요약해줘", "전체적으로 뭔 내용이야", "핵심만 알려줘")
+- SEARCH: 특정 정보를 찾는 질문 (예: "XG-200 출력은?", "A의 가격은?", "B가 뭐야?")
+- SUMMARY: 전체 요약, 개요, 매뉴얼/가이드 요청 (예: "문서 요약해줘", "전체 절차 알려줘", "매뉴얼 알려줘", "어떻게 하는지 알려줘")
 - COMPARE: 비교/대조 요청 (예: "A와 B 차이점", "장단점 비교해줘")
 - LIST: 목록/나열 요청 (예: "모든 제품 목록", "기능 전부 알려줘", "종류가 뭐가 있어")
 
@@ -369,6 +375,89 @@ def extract_comparison_entities(query):
     except:
         return [query]
 
+class SummaryCache:
+    """
+    사전 생성된 요약을 저장하는 캐시 클래스
+    인덱싱 단계에서 미리 요약을 생성해두고 질문 시 바로 사용
+    """
+    def __init__(self):
+        self.full_summary = None      # 전체 문서 요약
+        self.section_summaries = []   # 섹션별 요약 리스트
+        self.is_ready = False
+
+    def generate(self, full_doc):
+        """
+        문서 로드 시 사전 요약을 생성합니다.
+        """
+        print("\n[Pre-Summary] 사전 요약 생성 중... (인덱싱 단계)")
+
+        max_doc_size = int(Config.NUM_CTX * Config.MAX_CONTEXT_RATIO * 4)
+
+        # 문서가 작으면 전체 문서를 그대로 사용
+        if len(full_doc) <= max_doc_size:
+            self.full_summary = full_doc
+            print(f"[Pre-Summary] 문서가 작음({len(full_doc)}자). 전체 문서를 캐시합니다.")
+            self.is_ready = True
+            return
+
+        # 문서가 크면 계층적 요약 수행
+        print(f"[Pre-Summary] 문서가 큼({len(full_doc)}자). 계층적 요약을 수행합니다...")
+
+        chunk_size = Config.SUMMARY_CHUNK_SIZE
+        chunks = chunk_text(full_doc, chunk_size, overlap=0)
+
+        print(f"[Pre-Summary] {len(chunks)}개 섹션으로 분할")
+
+        client = get_ollama_client()
+        summaries = []
+
+        for i, chunk in enumerate(chunks):
+            print(f"   [Pre-Summary] 섹션 {i+1}/{len(chunks)} 요약 중...")
+            prompt = f"""다음 내용을 3-5문장으로 핵심만 요약하세요.
+중요한 수치, 이름, 용어는 반드시 포함하세요.
+
+내용:
+{chunk}
+
+요약:"""
+
+            try:
+                res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+                summary = res['message']['content'].strip()
+                summaries.append(f"[섹션 {i+1}]\n{summary}")
+            except Exception as e:
+                print(f"   [Warning] 섹션 {i+1} 요약 실패: {e}")
+                summaries.append(f"[섹션 {i+1}]\n{chunk[:500]}...")
+
+        self.section_summaries = summaries
+        combined = "\n\n".join(summaries)
+
+        # 결합된 요약이 여전히 크면 2차 요약
+        if len(combined) > max_doc_size:
+            print(f"[Pre-Summary] 1차 요약 결과가 큼({len(combined)}자). 2차 요약 수행...")
+            prompt = f"""다음은 문서의 섹션별 요약입니다. 이를 하나의 통합된 요약으로 정리하세요.
+핵심 내용, 주요 절차, 중요한 수치를 포함하세요.
+
+{combined}
+
+통합 요약:"""
+            try:
+                res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+                self.full_summary = res['message']['content'].strip()
+            except:
+                self.full_summary = combined
+        else:
+            self.full_summary = combined
+
+        print(f"[Pre-Summary] 사전 요약 완료 ({len(full_doc)}자 → {len(self.full_summary)}자)")
+        self.is_ready = True
+
+    def get_summary(self):
+        """캐시된 요약을 반환합니다."""
+        if self.is_ready and self.full_summary:
+            return self.full_summary
+        return None
+
 # ==========================================
 # 6. 메인 로직
 # ==========================================
@@ -396,6 +485,13 @@ def main():
     # 두 스토어 모두에 데이터 주입
     vector_store.add_documents(chunks)
     keyword_store.add_documents(chunks)
+
+    # 3. 사전 요약 생성 (선택적)
+    summary_cache = SummaryCache()
+    if Config.PRE_SUMMARIZE:
+        summary_cache.generate(text)
+    else:
+        print("[Pre-Summary] 사전 요약 비활성화됨 (Config.PRE_SUMMARIZE=False)")
 
     while True:
         print("\n" + "="*40)
@@ -476,15 +572,20 @@ def main():
 
             # 2. 유형별 처리
             if query_type == QueryType.SUMMARY:
-                # 요약형: 전체 문서 또는 계층적 요약
-                max_doc_size = int(Config.NUM_CTX * Config.MAX_CONTEXT_RATIO * 4)  # 글자 수 추정
-
-                if len(text) <= max_doc_size:
-                    context = text
-                    print(f"[Mode 5-SUMMARY] 전체 문서({len(text)}자)를 컨텍스트로 사용합니다.")
+                # 요약형: 사전 생성된 요약 사용 (없으면 실시간 생성)
+                cached = summary_cache.get_summary()
+                if cached:
+                    context = cached
+                    print(f"[Mode 5-SUMMARY] 사전 생성된 요약 사용 ({len(cached)}자) ⚡ 빠른 응답")
                 else:
-                    print(f"[Mode 5-SUMMARY] 문서가 큼({len(text)}자). 계층적 요약을 수행합니다.")
-                    context = hierarchical_summary(text)
+                    # 사전 요약이 없으면 기존 방식으로 실시간 생성
+                    max_doc_size = int(Config.NUM_CTX * Config.MAX_CONTEXT_RATIO * 4)
+                    if len(text) <= max_doc_size:
+                        context = text
+                        print(f"[Mode 5-SUMMARY] 전체 문서({len(text)}자)를 컨텍스트로 사용합니다.")
+                    else:
+                        print(f"[Mode 5-SUMMARY] 문서가 큼({len(text)}자). 계층적 요약을 수행합니다.")
+                        context = hierarchical_summary(text)
 
             elif query_type == QueryType.LIST:
                 # 목록형: 더 많은 청크 검색
