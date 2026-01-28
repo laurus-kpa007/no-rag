@@ -3,6 +3,9 @@
 
 import os
 import sys
+import json
+import pickle
+import hashlib
 import ollama
 import chromadb
 from rank_bm25 import BM25Okapi
@@ -34,10 +37,138 @@ class Config:
     MAX_CONTEXT_RATIO = 0.7       # 전체 문서 투입 가능 비율 (NUM_CTX 대비)
     PRE_SUMMARIZE = True          # 인덱싱 시 사전 요약 생성 여부
 
+    # 캐시 설정
+    CACHE_ENABLED = True          # 임베딩 캐시 사용 여부
+    CACHE_DIR = '.rag_cache'      # 캐시 저장 디렉토리
+
 # Ollama 클라이언트 (원격 호스트 지원)
 def get_ollama_client():
     """OLLAMA_HOST 설정을 사용하는 클라이언트 반환"""
     return ollama.Client(host=Config.OLLAMA_HOST)
+
+# ==========================================
+# 1.5 인덱스 캐시 (Index Cache)
+# ==========================================
+class IndexCache:
+    """
+    임베딩, 청크, 요약 데이터를 캐싱하여 재인덱싱을 방지합니다.
+    파일 크기, 수정일시, 설정값을 기반으로 캐시 유효성을 검증합니다.
+    """
+    def __init__(self, file_path):
+        self.file_path = os.path.abspath(file_path)
+        self.cache_dir = Config.CACHE_DIR
+        self.meta_file = os.path.join(self.cache_dir, 'cache_meta.json')
+        self.embeddings_file = os.path.join(self.cache_dir, 'embeddings.pkl')
+        self.chunks_file = os.path.join(self.cache_dir, 'chunks.pkl')
+        self.summary_file = os.path.join(self.cache_dir, 'summary.txt')
+
+        # 캐시 디렉토리 생성
+        if Config.CACHE_ENABLED and not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir)
+
+    def _get_file_meta(self):
+        """현재 파일의 메타데이터를 반환"""
+        stat = os.stat(self.file_path)
+        return {
+            'file_path': self.file_path,
+            'file_size': stat.st_size,
+            'file_mtime': stat.st_mtime,
+            # 설정값도 포함 (설정 변경 시 캐시 무효화)
+            'chunk_size': Config.CHUNK_SIZE,
+            'chunk_overlap': Config.CHUNK_OVERLAP,
+            'model_embed': Config.MODEL_EMBED,
+        }
+
+    def _load_cached_meta(self):
+        """저장된 캐시 메타데이터를 로드"""
+        if not os.path.exists(self.meta_file):
+            return None
+        try:
+            with open(self.meta_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            return None
+
+    def is_valid(self):
+        """
+        캐시가 유효한지 검증합니다.
+        파일 크기, 수정일시, 설정값이 모두 일치해야 유효합니다.
+        """
+        if not Config.CACHE_ENABLED:
+            return False
+
+        cached_meta = self._load_cached_meta()
+        if not cached_meta:
+            return False
+
+        current_meta = self._get_file_meta()
+
+        # 모든 메타데이터가 일치하는지 확인
+        for key in current_meta:
+            if cached_meta.get(key) != current_meta[key]:
+                print(f"   [Cache] 캐시 무효화: {key} 변경됨")
+                return False
+
+        # 캐시 파일들이 존재하는지 확인
+        if not os.path.exists(self.embeddings_file):
+            return False
+        if not os.path.exists(self.chunks_file):
+            return False
+
+        return True
+
+    def save(self, chunks, embeddings, summary=None):
+        """캐시 데이터를 저장"""
+        if not Config.CACHE_ENABLED:
+            return
+
+        # 메타데이터 저장
+        meta = self._get_file_meta()
+        meta['cached_at'] = os.path.getmtime(self.file_path)
+        with open(self.meta_file, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        # 청크 저장
+        with open(self.chunks_file, 'wb') as f:
+            pickle.dump(chunks, f)
+
+        # 임베딩 저장
+        with open(self.embeddings_file, 'wb') as f:
+            pickle.dump(embeddings, f)
+
+        # 요약 저장 (있는 경우)
+        if summary:
+            with open(self.summary_file, 'w', encoding='utf-8') as f:
+                f.write(summary)
+
+        print(f"   [Cache] 캐시 저장 완료: {self.cache_dir}/")
+
+    def load(self):
+        """캐시 데이터를 로드"""
+        chunks = None
+        embeddings = None
+        summary = None
+
+        try:
+            with open(self.chunks_file, 'rb') as f:
+                chunks = pickle.load(f)
+            with open(self.embeddings_file, 'rb') as f:
+                embeddings = pickle.load(f)
+            if os.path.exists(self.summary_file):
+                with open(self.summary_file, 'r', encoding='utf-8') as f:
+                    summary = f.read()
+        except Exception as e:
+            print(f"   [Cache] 캐시 로드 실패: {e}")
+            return None, None, None
+
+        return chunks, embeddings, summary
+
+    def clear(self):
+        """캐시를 삭제"""
+        for f in [self.meta_file, self.embeddings_file, self.chunks_file, self.summary_file]:
+            if os.path.exists(f):
+                os.remove(f)
+        print("   [Cache] 캐시 삭제 완료")
 
 # ==========================================
 # 2. 문서 로더 & 청킹 (Loader & Chunking)
@@ -112,19 +243,29 @@ class VectorStore:
         # 편의를 위해 chromadb의 DefaultEmbeddingFunction을 쓰지 않고 직접 주입 방식 사용.
         self.collection = self.client.create_collection(name="docs")
 
-    def add_documents(self, chunks):
+    def add_documents(self, chunks, embeddings=None):
+        """
+        문서를 벡터 DB에 추가합니다.
+        embeddings가 제공되면 그대로 사용하고, 없으면 새로 생성합니다.
+        """
         ids = [str(i) for i in range(len(chunks))]
-        # Ollama를 통해 임베딩 생성
-        embeddings = []
-        print("   [Vector] 임베딩 생성 중... (시간이 걸릴 수 있습니다)")
-        client = get_ollama_client()  # 원격 호스트 지원
-        for chunk in chunks:
-            try:
-                res = client.embeddings(model=Config.MODEL_EMBED, prompt=chunk)
-                embeddings.append(res['embedding'])
-            except Exception as e:
-                print(f"   [Error] 임베딩 생성 실패: {e}")
-                embeddings.append([0.0]*768) # 더미(실패 시)
+
+        # 임베딩이 제공되지 않은 경우 새로 생성
+        if embeddings is None:
+            embeddings = []
+            print("   [Vector] 임베딩 생성 중... (시간이 걸릴 수 있습니다)")
+            client = get_ollama_client()  # 원격 호스트 지원
+            for i, chunk in enumerate(chunks):
+                try:
+                    res = client.embeddings(model=Config.MODEL_EMBED, prompt=chunk)
+                    embeddings.append(res['embedding'])
+                    if (i + 1) % 10 == 0:
+                        print(f"   [Vector] {i+1}/{len(chunks)} 청크 임베딩 완료...")
+                except Exception as e:
+                    print(f"   [Error] 임베딩 생성 실패: {e}")
+                    embeddings.append([0.0]*768) # 더미(실패 시)
+        else:
+            print(f"   [Vector] 캐시된 임베딩 사용 ({len(embeddings)}개)")
 
         self.collection.add(
             documents=chunks,
@@ -132,6 +273,7 @@ class VectorStore:
             ids=ids
         )
         print(f"   [Vector] {len(chunks)}개 청크 벡터 DB 저장 완료.")
+        return embeddings  # 캐싱을 위해 임베딩 반환
 
     def search(self, query, top_k=5):
         # 쿼리 임베딩
@@ -474,24 +616,67 @@ def main():
     text = load_document(file_path)
     if not text: return
 
-    print(f"\n[System] 문서 로드 성공 ({len(text)}자). 청크 생성 중...")
-    chunks = chunk_text(text, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
-    print(f"[System] 총 {len(chunks)}개의 청크 생성됨.")
+    print(f"\n[System] 문서 로드 성공 ({len(text)}자).")
 
-    # 2. 인덱싱 (초기화)
+    # 2. 캐시 확인 및 인덱싱
+    index_cache = IndexCache(file_path)
     vector_store = VectorStore()
     keyword_store = KeywordStore()
-    
-    # 두 스토어 모두에 데이터 주입
-    vector_store.add_documents(chunks)
-    keyword_store.add_documents(chunks)
-
-    # 3. 사전 요약 생성 (선택적)
     summary_cache = SummaryCache()
-    if Config.PRE_SUMMARIZE:
-        summary_cache.generate(text)
+
+    if index_cache.is_valid():
+        # 캐시가 유효하면 로드
+        print("[Cache] ⚡ 유효한 캐시 발견! 캐시에서 로드합니다...")
+        cached_chunks, cached_embeddings, cached_summary = index_cache.load()
+
+        if cached_chunks and cached_embeddings:
+            chunks = cached_chunks
+            print(f"[Cache] {len(chunks)}개 청크 로드 완료")
+
+            # 벡터 스토어에 캐시된 임베딩 사용
+            vector_store.add_documents(chunks, embeddings=cached_embeddings)
+
+            # 키워드 스토어 인덱싱 (BM25는 빠르므로 항상 새로 생성)
+            keyword_store.add_documents(chunks)
+
+            # 캐시된 요약 사용
+            if cached_summary:
+                summary_cache.full_summary = cached_summary
+                summary_cache.is_ready = True
+                print(f"[Cache] 사전 요약 로드 완료 ({len(cached_summary)}자)")
+            elif Config.PRE_SUMMARIZE:
+                summary_cache.generate(text)
+        else:
+            print("[Cache] 캐시 로드 실패. 새로 인덱싱합니다...")
+            index_cache.clear()
+            # 아래 else 블록과 동일한 처리
+            chunks = chunk_text(text, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
+            print(f"[System] 총 {len(chunks)}개의 청크 생성됨.")
+            embeddings = vector_store.add_documents(chunks)
+            keyword_store.add_documents(chunks)
+            if Config.PRE_SUMMARIZE:
+                summary_cache.generate(text)
+            index_cache.save(chunks, embeddings, summary_cache.get_summary())
     else:
-        print("[Pre-Summary] 사전 요약 비활성화됨 (Config.PRE_SUMMARIZE=False)")
+        # 캐시가 없거나 무효화됨 → 새로 인덱싱
+        print("[Cache] 캐시 없음 또는 무효화됨. 새로 인덱싱합니다...")
+        chunks = chunk_text(text, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
+        print(f"[System] 총 {len(chunks)}개의 청크 생성됨.")
+
+        # 벡터 스토어 인덱싱 (임베딩 생성)
+        embeddings = vector_store.add_documents(chunks)
+
+        # 키워드 스토어 인덱싱
+        keyword_store.add_documents(chunks)
+
+        # 사전 요약 생성
+        if Config.PRE_SUMMARIZE:
+            summary_cache.generate(text)
+        else:
+            print("[Pre-Summary] 사전 요약 비활성화됨 (Config.PRE_SUMMARIZE=False)")
+
+        # 캐시 저장
+        index_cache.save(chunks, embeddings, summary_cache.get_summary())
 
     while True:
         print("\n" + "="*40)
