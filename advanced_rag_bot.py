@@ -29,7 +29,7 @@ class Config:
     # 검색 설정
     CHUNK_SIZE = 500              # 청크 크기 (글자 수)
     CHUNK_OVERLAP = 50            # 청크 겹침 크기
-    TOP_K = 5                     # 검색시 가져올 문서 수
+    SEARCH_TOP_K = 5              # 검색시 가져올 문서 수
     NUM_CTX = 32768               # LLM 컨텍스트 윈도우
 
     # Query Router 설정
@@ -41,10 +41,26 @@ class Config:
     CACHE_ENABLED = True          # 임베딩 캐시 사용 여부
     CACHE_DIR = '.rag_cache'      # 캐시 저장 디렉토리
 
+    # LLM 하이퍼파라미터 설정
+    TEMPERATURE = 0.7             # 응답 창의성 (0.0=결정적, 1.0=창의적, 2.0=매우 랜덤)
+    TOP_P = 0.9                   # Nucleus sampling (0.0~1.0, 낮을수록 집중적)
+    TOP_K = 40                    # Top-K sampling (높을수록 다양한 토큰 고려)
+    REPEAT_PENALTY = 1.1          # 반복 페널티 (1.0=페널티 없음, 높을수록 반복 억제)
+
 # Ollama 클라이언트 (원격 호스트 지원)
 def get_ollama_client():
     """OLLAMA_HOST 설정을 사용하는 클라이언트 반환"""
     return ollama.Client(host=Config.OLLAMA_HOST)
+
+def get_llm_options():
+    """LLM 호출 시 사용할 options 딕셔너리 반환"""
+    return {
+        'num_ctx': Config.NUM_CTX,
+        'temperature': Config.TEMPERATURE,
+        'top_p': Config.TOP_P,
+        'top_k': Config.TOP_K,
+        'repeat_penalty': Config.REPEAT_PENALTY,
+    }
 
 # ==========================================
 # 1.5 인덱스 캐시 (Index Cache)
@@ -336,7 +352,7 @@ def correct_query(query, context_chunks=None):
 """
     try:
         client = get_ollama_client()  # 원격 호스트 지원
-        res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+        res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}], options=get_llm_options())
         corrected = res['message']['content'].strip()
         return corrected.replace('"', '').replace("'", "")
     except:
@@ -365,7 +381,7 @@ def rerank_documents(query, docs):
 설명은 하지 마세요.
 """
         try:
-            res = client.chat(model=Config.MODEL_RERANK, messages=[{'role': 'user', 'content': prompt}])
+            res = client.chat(model=Config.MODEL_RERANK, messages=[{'role': 'user', 'content': prompt}], options=get_llm_options())
             content = res['message']['content'].strip().lower()
             score = 1 if 'yes' in content else 0
             if score == 1:
@@ -438,7 +454,7 @@ def classify_query_llm(query):
 
     try:
         client = get_ollama_client()
-        res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+        res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}], options=get_llm_options())
         result = res['message']['content'].strip().upper()
 
         # 유효한 유형인지 확인
@@ -480,7 +496,7 @@ def hierarchical_summary(full_doc, chunk_size=None):
 요약:"""
 
         try:
-            res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+            res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}], options=get_llm_options())
             summary = res['message']['content'].strip()
             summaries.append(f"[섹션 {i+1}]\n{summary}")
         except Exception as e:
@@ -511,7 +527,7 @@ def extract_comparison_entities(query):
 
     try:
         client = get_ollama_client()
-        res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+        res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}], options=get_llm_options())
         entities = [e.strip() for e in res['message']['content'].split(',')]
         return entities if entities else [query]
     except:
@@ -564,7 +580,7 @@ class SummaryCache:
 요약:"""
 
             try:
-                res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+                res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}], options=get_llm_options())
                 summary = res['message']['content'].strip()
                 summaries.append(f"[섹션 {i+1}]\n{summary}")
             except Exception as e:
@@ -584,7 +600,7 @@ class SummaryCache:
 
 통합 요약:"""
             try:
-                res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+                res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}], options=get_llm_options())
                 self.full_summary = res['message']['content'].strip()
             except:
                 self.full_summary = combined
@@ -719,18 +735,18 @@ def main():
             print(f"[Mode 1] 전체 문서({len(text)}자)를 컨텍스트로 사용합니다.")
             
         elif mode == '2':
-            docs = vector_store.search(query, top_k=Config.TOP_K)
+            docs = vector_store.search(query, top_k=Config.SEARCH_TOP_K)
             context = "\n---\n".join(docs)
             print(f"[Mode 2] 벡터 유사도 상위 {len(docs)}개 청크 사용.")
             
         elif mode == '3':
-            docs = keyword_store.search(query, top_k=Config.TOP_K)
+            docs = keyword_store.search(query, top_k=Config.SEARCH_TOP_K)
             context = "\n---\n".join(docs)
             print(f"[Mode 3] 키워드 매칭 상위 {len(docs)}개 청크 사용.")
             
         elif mode == '4':
-            vec_docs = vector_store.search(query, top_k=Config.TOP_K)
-            key_docs = keyword_store.search(query, top_k=Config.TOP_K)
+            vec_docs = vector_store.search(query, top_k=Config.SEARCH_TOP_K)
+            key_docs = keyword_store.search(query, top_k=Config.SEARCH_TOP_K)
 
             # 중복 제거해서 합치기
             combined_docs = list(set(vec_docs + key_docs))
@@ -774,7 +790,7 @@ def main():
 
             elif query_type == QueryType.LIST:
                 # 목록형: 더 많은 청크 검색
-                extended_top_k = min(Config.TOP_K * 4, len(chunks))
+                extended_top_k = min(Config.SEARCH_TOP_K * 4, len(chunks))
                 vec_docs = vector_store.search(query, top_k=extended_top_k)
                 key_docs = keyword_store.search(query, top_k=extended_top_k)
                 combined_docs = list(set(vec_docs + key_docs))
@@ -788,8 +804,8 @@ def main():
 
                 all_docs = []
                 for entity in entities:
-                    vec_docs = vector_store.search(entity, top_k=Config.TOP_K)
-                    key_docs = keyword_store.search(entity, top_k=Config.TOP_K)
+                    vec_docs = vector_store.search(entity, top_k=Config.SEARCH_TOP_K)
+                    key_docs = keyword_store.search(entity, top_k=Config.SEARCH_TOP_K)
                     all_docs.extend(vec_docs + key_docs)
 
                 combined_docs = list(set(all_docs))
@@ -799,8 +815,8 @@ def main():
 
             else:  # QueryType.SEARCH
                 # 검색형: 하이브리드 검색 + 리랭킹 (기존 모드 4와 동일)
-                vec_docs = vector_store.search(query, top_k=Config.TOP_K)
-                key_docs = keyword_store.search(query, top_k=Config.TOP_K)
+                vec_docs = vector_store.search(query, top_k=Config.SEARCH_TOP_K)
+                key_docs = keyword_store.search(query, top_k=Config.SEARCH_TOP_K)
                 combined_docs = list(set(vec_docs + key_docs))
                 final_docs = rerank_documents(query, combined_docs)
                 context = "\n---\n".join(final_docs)
@@ -829,7 +845,7 @@ def main():
                 model=Config.MODEL_CHAT,
                 messages=[{'role': 'user', 'content': prompt}],
                 stream=True,
-                options={'num_ctx': Config.NUM_CTX}
+                options=get_llm_options()
             )
             for chunk in stream:
                 print(chunk['message']['content'], end="", flush=True)
