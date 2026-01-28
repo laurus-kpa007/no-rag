@@ -3,6 +3,9 @@
 
 import os
 import sys
+import json
+import pickle
+import hashlib
 import ollama
 import chromadb
 from rank_bm25 import BM25Okapi
@@ -26,7 +29,7 @@ class Config:
     # 검색 설정
     CHUNK_SIZE = 500              # 청크 크기 (글자 수)
     CHUNK_OVERLAP = 50            # 청크 겹침 크기
-    TOP_K = 5                     # 검색시 가져올 문서 수
+    SEARCH_TOP_K = 5              # 검색시 가져올 문서 수
     NUM_CTX = 32768               # LLM 컨텍스트 윈도우
 
     # Query Router 설정
@@ -34,10 +37,154 @@ class Config:
     MAX_CONTEXT_RATIO = 0.7       # 전체 문서 투입 가능 비율 (NUM_CTX 대비)
     PRE_SUMMARIZE = True          # 인덱싱 시 사전 요약 생성 여부
 
+    # 캐시 설정
+    CACHE_ENABLED = True          # 임베딩 캐시 사용 여부
+    CACHE_DIR = '.rag_cache'      # 캐시 저장 디렉토리
+
+    # LLM 하이퍼파라미터 설정
+    TEMPERATURE = 0.7             # 응답 창의성 (0.0=결정적, 1.0=창의적, 2.0=매우 랜덤)
+    TOP_P = 0.9                   # Nucleus sampling (0.0~1.0, 낮을수록 집중적)
+    TOP_K = 40                    # Top-K sampling (높을수록 다양한 토큰 고려)
+    REPEAT_PENALTY = 1.1          # 반복 페널티 (1.0=페널티 없음, 높을수록 반복 억제)
+
 # Ollama 클라이언트 (원격 호스트 지원)
 def get_ollama_client():
     """OLLAMA_HOST 설정을 사용하는 클라이언트 반환"""
     return ollama.Client(host=Config.OLLAMA_HOST)
+
+def get_llm_options():
+    """LLM 호출 시 사용할 options 딕셔너리 반환"""
+    return {
+        'num_ctx': Config.NUM_CTX,
+        'temperature': Config.TEMPERATURE,
+        'top_p': Config.TOP_P,
+        'top_k': Config.TOP_K,
+        'repeat_penalty': Config.REPEAT_PENALTY,
+    }
+
+# ==========================================
+# 1.5 인덱스 캐시 (Index Cache)
+# ==========================================
+class IndexCache:
+    """
+    임베딩, 청크, 요약 데이터를 캐싱하여 재인덱싱을 방지합니다.
+    파일 크기, 수정일시, 설정값을 기반으로 캐시 유효성을 검증합니다.
+    """
+    def __init__(self, file_path):
+        self.file_path = os.path.abspath(file_path)
+        self.cache_dir = Config.CACHE_DIR
+        self.meta_file = os.path.join(self.cache_dir, 'cache_meta.json')
+        self.embeddings_file = os.path.join(self.cache_dir, 'embeddings.pkl')
+        self.chunks_file = os.path.join(self.cache_dir, 'chunks.pkl')
+        self.summary_file = os.path.join(self.cache_dir, 'summary.txt')
+
+        # 캐시 디렉토리 생성
+        if Config.CACHE_ENABLED and not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir)
+
+    def _get_file_meta(self):
+        """현재 파일의 메타데이터를 반환"""
+        stat = os.stat(self.file_path)
+        return {
+            'file_path': self.file_path,
+            'file_size': stat.st_size,
+            'file_mtime': stat.st_mtime,
+            # 설정값도 포함 (설정 변경 시 캐시 무효화)
+            'chunk_size': Config.CHUNK_SIZE,
+            'chunk_overlap': Config.CHUNK_OVERLAP,
+            'model_embed': Config.MODEL_EMBED,
+        }
+
+    def _load_cached_meta(self):
+        """저장된 캐시 메타데이터를 로드"""
+        if not os.path.exists(self.meta_file):
+            return None
+        try:
+            with open(self.meta_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            return None
+
+    def is_valid(self):
+        """
+        캐시가 유효한지 검증합니다.
+        파일 크기, 수정일시, 설정값이 모두 일치해야 유효합니다.
+        """
+        if not Config.CACHE_ENABLED:
+            return False
+
+        cached_meta = self._load_cached_meta()
+        if not cached_meta:
+            return False
+
+        current_meta = self._get_file_meta()
+
+        # 모든 메타데이터가 일치하는지 확인
+        for key in current_meta:
+            if cached_meta.get(key) != current_meta[key]:
+                print(f"   [Cache] 캐시 무효화: {key} 변경됨")
+                return False
+
+        # 캐시 파일들이 존재하는지 확인
+        if not os.path.exists(self.embeddings_file):
+            return False
+        if not os.path.exists(self.chunks_file):
+            return False
+
+        return True
+
+    def save(self, chunks, embeddings, summary=None):
+        """캐시 데이터를 저장"""
+        if not Config.CACHE_ENABLED:
+            return
+
+        # 메타데이터 저장
+        meta = self._get_file_meta()
+        meta['cached_at'] = os.path.getmtime(self.file_path)
+        with open(self.meta_file, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        # 청크 저장
+        with open(self.chunks_file, 'wb') as f:
+            pickle.dump(chunks, f)
+
+        # 임베딩 저장
+        with open(self.embeddings_file, 'wb') as f:
+            pickle.dump(embeddings, f)
+
+        # 요약 저장 (있는 경우)
+        if summary:
+            with open(self.summary_file, 'w', encoding='utf-8') as f:
+                f.write(summary)
+
+        print(f"   [Cache] 캐시 저장 완료: {self.cache_dir}/")
+
+    def load(self):
+        """캐시 데이터를 로드"""
+        chunks = None
+        embeddings = None
+        summary = None
+
+        try:
+            with open(self.chunks_file, 'rb') as f:
+                chunks = pickle.load(f)
+            with open(self.embeddings_file, 'rb') as f:
+                embeddings = pickle.load(f)
+            if os.path.exists(self.summary_file):
+                with open(self.summary_file, 'r', encoding='utf-8') as f:
+                    summary = f.read()
+        except Exception as e:
+            print(f"   [Cache] 캐시 로드 실패: {e}")
+            return None, None, None
+
+        return chunks, embeddings, summary
+
+    def clear(self):
+        """캐시를 삭제"""
+        for f in [self.meta_file, self.embeddings_file, self.chunks_file, self.summary_file]:
+            if os.path.exists(f):
+                os.remove(f)
+        print("   [Cache] 캐시 삭제 완료")
 
 # ==========================================
 # 2. 문서 로더 & 청킹 (Loader & Chunking)
@@ -101,86 +248,7 @@ def chunk_text(text, size, overlap):
     return chunks
 
 # ==========================================
-# 3. 메타데이터 저장소 (Metadata Store)
-# ==========================================
-class MetadataStore:
-    """
-    문서 인덱싱 시 추출한 메타데이터를 저장합니다.
-    - 도메인/주제
-    - 주요 키워드
-    - 전문 용어
-    """
-    def __init__(self):
-        self.domain = ""
-        self.keywords = []
-        self.technical_terms = []
-        self.is_ready = False
-
-    def extract_metadata(self, full_doc):
-        """
-        문서 전체에서 메타데이터를 추출합니다.
-        """
-        print("\n[Metadata] 문서 메타데이터 추출 중...")
-
-        # 문서가 너무 크면 앞부분만 샘플링
-        sample = full_doc[:3000] if len(full_doc) > 3000 else full_doc
-
-        prompt = f"""다음 문서를 분석하여 메타데이터를 추출하세요.
-
-[문서 샘플]
-{sample}
-
-다음 형식으로만 출력하세요:
-도메인: [문서의 주제/분야를 한 문장으로]
-키워드: [중요 키워드 5-10개, 쉼표로 구분]
-전문용어: [전문 용어/고유명사 5-10개, 쉼표로 구분]
-
-예시:
-도메인: 의료기기 제품 사양서
-키워드: 출력, 전압, 전류, 정격, 안전규격, 인증
-전문용어: XG-200, CE마크, IEC60601, 절연저항, 누설전류"""
-
-        try:
-            client = get_ollama_client()
-            res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
-            content = res['message']['content'].strip()
-
-            # 파싱
-            for line in content.split('\n'):
-                if line.startswith('도메인:'):
-                    self.domain = line.replace('도메인:', '').strip()
-                elif line.startswith('키워드:'):
-                    keywords_str = line.replace('키워드:', '').strip()
-                    self.keywords = [k.strip() for k in keywords_str.split(',')]
-                elif line.startswith('전문용어:'):
-                    terms_str = line.replace('전문용어:', '').strip()
-                    self.technical_terms = [t.strip() for t in terms_str.split(',')]
-
-            self.is_ready = True
-            print(f"[Metadata] 추출 완료")
-            print(f"   도메인: {self.domain}")
-            print(f"   키워드: {', '.join(self.keywords[:5])}...")
-            print(f"   전문용어: {', '.join(self.technical_terms[:5])}...")
-
-        except Exception as e:
-            print(f"[Metadata] 추출 실패: {e}")
-            self.is_ready = False
-
-    def get_metadata_context(self):
-        """
-        질의 교정에 사용할 메타데이터 컨텍스트를 반환합니다.
-        """
-        if not self.is_ready:
-            return ""
-
-        context = f"""[문서 메타데이터]
-도메인: {self.domain}
-주요 키워드: {', '.join(self.keywords)}
-전문 용어: {', '.join(self.technical_terms)}"""
-        return context
-
-# ==========================================
-# 4. 검색 엔진 (Retrievers)
+# 3. 검색 엔진 (Retrievers)
 # ==========================================
 class VectorStore:
     def __init__(self):
@@ -191,19 +259,29 @@ class VectorStore:
         # 편의를 위해 chromadb의 DefaultEmbeddingFunction을 쓰지 않고 직접 주입 방식 사용.
         self.collection = self.client.create_collection(name="docs")
 
-    def add_documents(self, chunks):
+    def add_documents(self, chunks, embeddings=None):
+        """
+        문서를 벡터 DB에 추가합니다.
+        embeddings가 제공되면 그대로 사용하고, 없으면 새로 생성합니다.
+        """
         ids = [str(i) for i in range(len(chunks))]
-        # Ollama를 통해 임베딩 생성
-        embeddings = []
-        print("   [Vector] 임베딩 생성 중... (시간이 걸릴 수 있습니다)")
-        client = get_ollama_client()  # 원격 호스트 지원
-        for chunk in chunks:
-            try:
-                res = client.embeddings(model=Config.MODEL_EMBED, prompt=chunk)
-                embeddings.append(res['embedding'])
-            except Exception as e:
-                print(f"   [Error] 임베딩 생성 실패: {e}")
-                embeddings.append([0.0]*768) # 더미(실패 시)
+
+        # 임베딩이 제공되지 않은 경우 새로 생성
+        if embeddings is None:
+            embeddings = []
+            print("   [Vector] 임베딩 생성 중... (시간이 걸릴 수 있습니다)")
+            client = get_ollama_client()  # 원격 호스트 지원
+            for i, chunk in enumerate(chunks):
+                try:
+                    res = client.embeddings(model=Config.MODEL_EMBED, prompt=chunk)
+                    embeddings.append(res['embedding'])
+                    if (i + 1) % 10 == 0:
+                        print(f"   [Vector] {i+1}/{len(chunks)} 청크 임베딩 완료...")
+                except Exception as e:
+                    print(f"   [Error] 임베딩 생성 실패: {e}")
+                    embeddings.append([0.0]*768) # 더미(실패 시)
+        else:
+            print(f"   [Vector] 캐시된 임베딩 사용 ({len(embeddings)}개)")
 
         self.collection.add(
             documents=chunks,
@@ -211,6 +289,7 @@ class VectorStore:
             ids=ids
         )
         print(f"   [Vector] {len(chunks)}개 청크 벡터 DB 저장 완료.")
+        return embeddings  # 캐싱을 위해 임베딩 반환
 
     def search(self, query, top_k=5):
         # 쿼리 임베딩
@@ -237,8 +316,16 @@ class KeywordStore:
         self.bm25 = BM25Okapi(tokenized_corpus)
         print(f"   [Keyword] BM25 인덱싱 완료.")
 
-    def search(self, query, top_k=5):
-        tokenized_query = query.split(" ")
+    def search(self, query, top_k=5, expanded_keywords=None):
+        """
+        BM25 검색을 수행합니다.
+        expanded_keywords가 제공되면 해당 키워드로 검색, 없으면 query를 토큰화하여 검색
+        """
+        if expanded_keywords:
+            tokenized_query = expanded_keywords
+        else:
+            tokenized_query = query.split(" ")
+
         # 점수 계산
         doc_scores = self.bm25.get_scores(tokenized_query)
         # 상위 k개 인덱스 추출
@@ -246,123 +333,80 @@ class KeywordStore:
         return [self.chunks[i] for i in top_n_indexes]
 
 # ==========================================
-# 5. Reranker & Query Refiner (LLM 기반)
+# 4. Reranker & Query Refiner (LLM 기반)
 # ==========================================
-def correct_query_with_metadata(query, metadata_store):
+def correct_and_expand_query(query, context_chunks=None):
     """
-    메타데이터를 사용하여 사용자 질문의 오타와 띄어쓰기를 교정하고,
-    질문 유형도 함께 분석합니다.
+    사용자 질문의 오타 교정 + 동의어/키워드 확장을 동시에 수행합니다.
+    한 번의 LLM 호출로 두 가지를 처리하여 효율성을 높입니다.
 
     Returns:
-        tuple: (corrected_query, query_type)
+        dict: {
+            'corrected': 교정된 질문,
+            'keywords': 확장된 키워드 리스트 (BM25용)
+        }
     """
-    if not metadata_store.is_ready:
-        # 메타데이터가 없으면 기본 교정
-        return correct_query_basic(query)
+    context_instruction = ""
+    if context_chunks:
+        snippets = "\n".join([c[:200] + "..." for c in context_chunks])
+        context_instruction = f"""
+[참고 문서 내용]
+{snippets}
 
-    metadata_context = metadata_store.get_metadata_context()
+위 문서에 등장하는 전문 용어나 표현을 우선적으로 사용하세요.
+"""
 
-    prompt = f"""당신은 질문 분석 전문가입니다. 다음 작업을 수행하세요:
-
-1. [질문]의 오타와 띄어쓰기를 교정
-2. [질문]의 유형을 분류
-
-{metadata_context}
-
-위 메타데이터의 전문 용어나 키워드를 우선 사용하여 교정하세요.
-
-질문 유형 분류 기준:
-- SEARCH: 특정 정보를 찾는 질문 (예: "재택근무 승인은?", "XG-200 출력은?", "가격은?", "주의할 점은?")
-- SUMMARY: 문서 전체/전반적인 내용 요약 요청 (예: "문서 요약해줘", "전체 내용 정리", "이 문서가 뭔 내용이야?")
-- COMPARE: 비교/대조 요청 (예: "A와 B 차이점", "장단점 비교")
-- LIST: 모든 항목 나열 요청 (예: "모든 제품 목록", "전체 종류", "모든 기능")
-
+    prompt = f"""당신은 검색 최적화 전문가입니다.
+아래 [질문]을 분석하여 두 가지 작업을 수행하세요.
+{context_instruction}
 [질문]
 {query}
 
-다음 형식으로만 출력하세요:
-교정된질문: [교정된 질문]
-유형: [SEARCH/SUMMARY/COMPARE/LIST]
+[작업 1] 오타/띄어쓰기 교정
+- 오타와 띄어쓰기를 교정한 문장
 
-예시:
-교정된질문: 재택근무 승인 절차는?
-유형: SEARCH
-"""
-    try:
-        client = get_ollama_client()
-        res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
-        content = res['message']['content'].strip()
-
-        # 파싱
-        corrected = query
-        query_type = QueryType.SEARCH  # 기본값
-
-        for line in content.split('\n'):
-            if line.startswith('교정된질문:'):
-                corrected = line.replace('교정된질문:', '').strip()
-                corrected = corrected.replace('"', '').replace("'", "")
-            elif line.startswith('유형:'):
-                type_str = line.replace('유형:', '').strip().upper()
-                if type_str in [QueryType.SEARCH, QueryType.SUMMARY, QueryType.COMPARE, QueryType.LIST]:
-                    query_type = type_str
-                # 혹시 유형이 문장에 포함되어 있을 경우
-                elif QueryType.SUMMARY in type_str:
-                    query_type = QueryType.SUMMARY
-                elif QueryType.COMPARE in type_str:
-                    query_type = QueryType.COMPARE
-                elif QueryType.LIST in type_str:
-                    query_type = QueryType.LIST
-
-        return corrected, query_type
-    except:
-        return query, QueryType.SEARCH
-
-def correct_query_basic(query):
-    """
-    기본 질의 교정 (메타데이터 없이)
-
-    Returns:
-        tuple: (corrected_query, query_type)
-    """
-    prompt = f"""당신은 질문 분석 전문가입니다. 다음 작업을 수행하세요:
-
-1. [질문]의 오타와 띄어쓰기를 교정
-2. [질문]의 유형을 분류
-
-질문 유형 분류 기준:
-- SEARCH: 특정 정보를 찾는 질문 (예: "재택근무 승인은?", "XG-200 출력은?", "가격은?", "주의할 점은?")
-- SUMMARY: 문서 전체/전반적인 내용 요약 요청 (예: "문서 요약해줘", "전체 내용 정리", "이 문서가 뭔 내용이야?")
-- COMPARE: 비교/대조 요청 (예: "A와 B 차이점", "장단점 비교")
-- LIST: 모든 항목 나열 요청 (예: "모든 제품 목록", "전체 종류", "모든 기능")
-
-[질문]
-{query}
+[작업 2] 검색 키워드 확장
+- 핵심 명사/용어 추출
+- 동의어 추가 (예: 제출=마감=신청, 기한=일정=날짜)
+- 조사/어미 제거한 원형
 
 다음 형식으로만 출력하세요:
-교정된질문: [교정된 질문]
-유형: [SEARCH/SUMMARY/COMPARE/LIST]
-"""
+교정: [교정된 질문]
+키워드: [키워드1, 키워드2, 키워드3, ...]"""
+
     try:
         client = get_ollama_client()
-        res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+        res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}], options=get_llm_options())
         content = res['message']['content'].strip()
 
-        # 파싱
+        # 응답 파싱
         corrected = query
-        query_type = QueryType.SEARCH
+        keywords = []
 
         for line in content.split('\n'):
-            if line.startswith('교정된질문:'):
-                corrected = line.replace('교정된질문:', '').strip()
-                corrected = corrected.replace('"', '').replace("'", "")
-            elif line.startswith('유형:'):
-                type_str = line.replace('유형:', '').strip().upper()
-                if type_str in [QueryType.SEARCH, QueryType.SUMMARY, QueryType.COMPARE, QueryType.LIST]:
-                    query_type = type_str
+            line = line.strip()
+            if line.startswith('교정:'):
+                corrected = line.replace('교정:', '').strip().replace('"', '').replace("'", "")
+            elif line.startswith('키워드:'):
+                kw_str = line.replace('키워드:', '').strip()
+                # [키워드1, 키워드2] 또는 키워드1, 키워드2 형식 처리
+                kw_str = kw_str.replace('[', '').replace(']', '')
+                keywords = [k.strip() for k in kw_str.split(',') if k.strip()]
 
-        return corrected, query_type
+        # 키워드가 비어있으면 기본 토큰화
+        if not keywords:
+            keywords = query.split()
+
+        return {
+            'corrected': corrected if corrected else query,
+            'keywords': keywords
+        }
     except:
-        return query, QueryType.SEARCH
+        return {
+            'corrected': query,
+            'keywords': query.split()
+        }
+
 
 def rerank_documents(query, docs):
     """
@@ -387,7 +431,7 @@ def rerank_documents(query, docs):
 설명은 하지 마세요.
 """
         try:
-            res = client.chat(model=Config.MODEL_RERANK, messages=[{'role': 'user', 'content': prompt}])
+            res = client.chat(model=Config.MODEL_RERANK, messages=[{'role': 'user', 'content': prompt}], options=get_llm_options())
             content = res['message']['content'].strip().lower()
             score = 1 if 'yes' in content else 0
             if score == 1:
@@ -408,21 +452,38 @@ class QueryType:
     COMPARE = "COMPARE"     # 비교/대조
     LIST = "LIST"           # 목록/나열
 
-# 키워드 기반 빠른 분류 (더 엄격하게 조정)
+# 키워드 기반 빠른 분류
 QUERY_PATTERNS = {
     QueryType.SUMMARY: [
-        # 명확한 요약/개요 요청만
-        "요약해", "요약해줘", "정리해", "정리해줘", "개요", "전체 내용", "전반적",
-        "summarize", "summary", "overview", "전체적으로",
-        "뭔 내용", "무슨 내용", "내용이 뭐", "문서 전체",
+        # 요약/개요 요청
+        "요약", "정리", "개요", "전체", "전반", "대략", "간단히", "핵심",
+        "summarize", "summary", "overview", "briefly", "overall", "gist",
+        "뭔 내용", "무슨 내용", "어떤 내용", "내용이 뭐", "알려줘 전체",
+        # 매뉴얼/가이드 요청 (전체 절차를 원함)
+        "매뉴얼", "메뉴얼", "가이드", "안내", "절차", "프로세스", "순서",
+        "어떻게 해", "어떻게 하", "방법 알려", "방법을 알려", "전체 과정",
+        "manual", "guide", "process", "procedure", "how to", "step by step",
+        # 주요 내용 요청
+        "주요 내용", "주요내용", "중요한 내용", "핵심 내용", "핵심내용",
+        "대강", "대충", "간략", "간략히", "짧게", "요점",
     ],
     QueryType.LIST: [
-        "모든", "전부", "목록", "리스트", "나열해", "종류 전부", "몇 가지",
-        "all", "list", "every", "모두", "전체 종류",
+        # 목록/나열 요청
+        "모든", "전부", "목록", "리스트", "나열", "종류", "몇 가지", "몇가지",
+        "all", "list", "every", "types", "종류별", "항목",
+        # 추가 패턴
+        "어떤 것들", "뭐가 있", "뭐뭐", "무엇무엇", "몇 개", "몇개",
+        "각각", "하나씩", "전체 목록", "모두 알려", "다 알려",
+        "what are", "which ones", "enumerate",
     ],
     QueryType.COMPARE: [
+        # 비교/대조 요청
         "비교", "차이", "vs", "versus", "장단점", "다른점", "공통점",
-        "compare", "difference", "pros and cons",
+        "compare", "difference", "pros and cons", "versus", "differ",
+        # 추가 패턴
+        "뭐가 다", "뭐가 달라", "어떻게 다", "차이점", "다른 점",
+        "뭐가 좋", "뭐가 나", "어느 게 나", "어떤 게 나",
+        "대비", "versus", "and vs", "or vs",
     ],
 }
 
@@ -456,7 +517,7 @@ def classify_query_llm(query):
 
     try:
         client = get_ollama_client()
-        res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+        res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}], options=get_llm_options())
         result = res['message']['content'].strip().upper()
 
         # 유효한 유형인지 확인
@@ -498,7 +559,7 @@ def hierarchical_summary(full_doc, chunk_size=None):
 요약:"""
 
         try:
-            res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+            res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}], options=get_llm_options())
             summary = res['message']['content'].strip()
             summaries.append(f"[섹션 {i+1}]\n{summary}")
         except Exception as e:
@@ -529,7 +590,7 @@ def extract_comparison_entities(query):
 
     try:
         client = get_ollama_client()
-        res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+        res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}], options=get_llm_options())
         entities = [e.strip() for e in res['message']['content'].split(',')]
         return entities if entities else [query]
     except:
@@ -582,7 +643,7 @@ class SummaryCache:
 요약:"""
 
             try:
-                res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+                res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}], options=get_llm_options())
                 summary = res['message']['content'].strip()
                 summaries.append(f"[섹션 {i+1}]\n{summary}")
             except Exception as e:
@@ -602,7 +663,7 @@ class SummaryCache:
 
 통합 요약:"""
             try:
-                res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}])
+                res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}], options=get_llm_options())
                 self.full_summary = res['message']['content'].strip()
             except:
                 self.full_summary = combined
@@ -634,28 +695,67 @@ def main():
     text = load_document(file_path)
     if not text: return
 
-    print(f"\n[System] 문서 로드 성공 ({len(text)}자). 청크 생성 중...")
-    chunks = chunk_text(text, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
-    print(f"[System] 총 {len(chunks)}개의 청크 생성됨.")
+    print(f"\n[System] 문서 로드 성공 ({len(text)}자).")
 
-    # 2. 메타데이터 추출
-    metadata_store = MetadataStore()
-    metadata_store.extract_metadata(text)
-
-    # 3. 인덱싱 (초기화)
+    # 2. 캐시 확인 및 인덱싱
+    index_cache = IndexCache(file_path)
     vector_store = VectorStore()
     keyword_store = KeywordStore()
-
-    # 두 스토어 모두에 데이터 주입
-    vector_store.add_documents(chunks)
-    keyword_store.add_documents(chunks)
-
-    # 4. 사전 요약 생성 (선택적)
     summary_cache = SummaryCache()
-    if Config.PRE_SUMMARIZE:
-        summary_cache.generate(text)
+
+    if index_cache.is_valid():
+        # 캐시가 유효하면 로드
+        print("[Cache] ⚡ 유효한 캐시 발견! 캐시에서 로드합니다...")
+        cached_chunks, cached_embeddings, cached_summary = index_cache.load()
+
+        if cached_chunks and cached_embeddings:
+            chunks = cached_chunks
+            print(f"[Cache] {len(chunks)}개 청크 로드 완료")
+
+            # 벡터 스토어에 캐시된 임베딩 사용
+            vector_store.add_documents(chunks, embeddings=cached_embeddings)
+
+            # 키워드 스토어 인덱싱 (BM25는 빠르므로 항상 새로 생성)
+            keyword_store.add_documents(chunks)
+
+            # 캐시된 요약 사용
+            if cached_summary:
+                summary_cache.full_summary = cached_summary
+                summary_cache.is_ready = True
+                print(f"[Cache] 사전 요약 로드 완료 ({len(cached_summary)}자)")
+            elif Config.PRE_SUMMARIZE:
+                summary_cache.generate(text)
+        else:
+            print("[Cache] 캐시 로드 실패. 새로 인덱싱합니다...")
+            index_cache.clear()
+            # 아래 else 블록과 동일한 처리
+            chunks = chunk_text(text, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
+            print(f"[System] 총 {len(chunks)}개의 청크 생성됨.")
+            embeddings = vector_store.add_documents(chunks)
+            keyword_store.add_documents(chunks)
+            if Config.PRE_SUMMARIZE:
+                summary_cache.generate(text)
+            index_cache.save(chunks, embeddings, summary_cache.get_summary())
     else:
-        print("[Pre-Summary] 사전 요약 비활성화됨 (Config.PRE_SUMMARIZE=False)")
+        # 캐시가 없거나 무효화됨 → 새로 인덱싱
+        print("[Cache] 캐시 없음 또는 무효화됨. 새로 인덱싱합니다...")
+        chunks = chunk_text(text, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
+        print(f"[System] 총 {len(chunks)}개의 청크 생성됨.")
+
+        # 벡터 스토어 인덱싱 (임베딩 생성)
+        embeddings = vector_store.add_documents(chunks)
+
+        # 키워드 스토어 인덱싱
+        keyword_store.add_documents(chunks)
+
+        # 사전 요약 생성
+        if Config.PRE_SUMMARIZE:
+            summary_cache.generate(text)
+        else:
+            print("[Pre-Summary] 사전 요약 비활성화됨 (Config.PRE_SUMMARIZE=False)")
+
+        # 캐시 저장
+        index_cache.save(chunks, embeddings, summary_cache.get_summary())
 
     while True:
         print("\n" + "="*40)
@@ -668,20 +768,30 @@ def main():
         print("="*40)
 
         mode = input("검색 모드를 선택하세요 (1-5): ").strip()
-        if mode.lower() in ['q', 'exit', 'ㅂ']: break
+        if mode.lower() in ['q', 'exit']: break
         
         original_query = input("\n질문: ").strip()
         if not original_query: continue
 
-        # 메타데이터 기반 질문 교정 및 유형 분석 (벡터 검색 없이)
-        print("   [Query] 질문 분석 중... (교정 + 유형 판단)")
-        query, detected_query_type = correct_query_with_metadata(original_query, metadata_store)
+        # 문맥 기반 질문 교정 + 키워드 확장 (한 번의 LLM 호출)
+        print("   [Query] 오타 교정 및 키워드 확장 중...")
+        try:
+            # 1. 벡터 검색으로 관련 문맥(청크)를 먼저 가져옴 (오타에 강함)
+            pre_search_docs = vector_store.search(original_query, top_k=3)
+        except Exception as e:
+            print(f"   [Warning] 문맥 파악 실패: {e}")
+            pre_search_docs = []
+
+        # 오타 교정 + 동의어 확장 동시 수행
+        query_result = correct_and_expand_query(original_query, context_chunks=pre_search_docs)
+        query = query_result['corrected']
+        expanded_keywords = query_result['keywords']
 
         if query != original_query:
             print(f"   => 교정된 질문: {query}")
         else:
             print(f"   => 질문: {query}")
-        print(f"   => 질문 유형: {detected_query_type}")
+        print(f"   => 확장 키워드: {expanded_keywords}")
 
         context = ""
         
@@ -691,18 +801,18 @@ def main():
             print(f"[Mode 1] 전체 문서({len(text)}자)를 컨텍스트로 사용합니다.")
             
         elif mode == '2':
-            docs = vector_store.search(query, top_k=Config.TOP_K)
+            docs = vector_store.search(query, top_k=Config.SEARCH_TOP_K)
             context = "\n---\n".join(docs)
             print(f"[Mode 2] 벡터 유사도 상위 {len(docs)}개 청크 사용.")
             
         elif mode == '3':
-            docs = keyword_store.search(query, top_k=Config.TOP_K)
+            docs = keyword_store.search(query, top_k=Config.SEARCH_TOP_K, expanded_keywords=expanded_keywords)
             context = "\n---\n".join(docs)
             print(f"[Mode 3] 키워드 매칭 상위 {len(docs)}개 청크 사용.")
             
         elif mode == '4':
-            vec_docs = vector_store.search(query, top_k=Config.TOP_K)
-            key_docs = keyword_store.search(query, top_k=Config.TOP_K)
+            vec_docs = vector_store.search(query, top_k=Config.SEARCH_TOP_K)
+            key_docs = keyword_store.search(query, top_k=Config.SEARCH_TOP_K, expanded_keywords=expanded_keywords)
 
             # 중복 제거해서 합치기
             combined_docs = list(set(vec_docs + key_docs))
@@ -715,9 +825,17 @@ def main():
 
         elif mode == '5':
             # === 자동 모드 (Query Router) ===
-            # 이미 질의 교정 단계에서 LLM이 유형을 판단했으므로 그것을 사용
-            query_type = detected_query_type
-            print(f"   [Router] LLM이 분석한 질문 유형 사용: {query_type}")
+            print("   [Router] 질문 유형 분석 중...")
+
+            # 1. 질문 유형 분류 (빠른 키워드 분류 먼저, 불확실하면 LLM)
+            query_type = classify_query_fast(query)
+
+            # 키워드로 SEARCH로 분류되었지만, LLM으로 재확인 (선택적)
+            if query_type == QueryType.SEARCH:
+                # 더 정확한 분류가 필요하면 LLM 사용 (비용 vs 정확도 트레이드오프)
+                query_type = classify_query_llm(query)
+
+            print(f"   [Router] 질문 유형: {query_type}")
 
             # 2. 유형별 처리
             if query_type == QueryType.SUMMARY:
@@ -738,9 +856,9 @@ def main():
 
             elif query_type == QueryType.LIST:
                 # 목록형: 더 많은 청크 검색
-                extended_top_k = min(Config.TOP_K * 4, len(chunks))
+                extended_top_k = min(Config.SEARCH_TOP_K * 4, len(chunks))
                 vec_docs = vector_store.search(query, top_k=extended_top_k)
-                key_docs = keyword_store.search(query, top_k=extended_top_k)
+                key_docs = keyword_store.search(query, top_k=extended_top_k, expanded_keywords=expanded_keywords)
                 combined_docs = list(set(vec_docs + key_docs))
                 context = "\n---\n".join(combined_docs)
                 print(f"[Mode 5-LIST] 확장 검색으로 {len(combined_docs)}개 청크 사용.")
@@ -752,8 +870,9 @@ def main():
 
                 all_docs = []
                 for entity in entities:
-                    vec_docs = vector_store.search(entity, top_k=Config.TOP_K)
-                    key_docs = keyword_store.search(entity, top_k=Config.TOP_K)
+                    vec_docs = vector_store.search(entity, top_k=Config.SEARCH_TOP_K)
+                    # 엔티티 검색은 해당 엔티티를 키워드로 사용
+                    key_docs = keyword_store.search(entity, top_k=Config.SEARCH_TOP_K, expanded_keywords=[entity])
                     all_docs.extend(vec_docs + key_docs)
 
                 combined_docs = list(set(all_docs))
@@ -763,8 +882,8 @@ def main():
 
             else:  # QueryType.SEARCH
                 # 검색형: 하이브리드 검색 + 리랭킹 (기존 모드 4와 동일)
-                vec_docs = vector_store.search(query, top_k=Config.TOP_K)
-                key_docs = keyword_store.search(query, top_k=Config.TOP_K)
+                vec_docs = vector_store.search(query, top_k=Config.SEARCH_TOP_K)
+                key_docs = keyword_store.search(query, top_k=Config.SEARCH_TOP_K, expanded_keywords=expanded_keywords)
                 combined_docs = list(set(vec_docs + key_docs))
                 final_docs = rerank_documents(query, combined_docs)
                 context = "\n---\n".join(final_docs)
@@ -793,7 +912,7 @@ def main():
                 model=Config.MODEL_CHAT,
                 messages=[{'role': 'user', 'content': prompt}],
                 stream=True,
-                options={'num_ctx': Config.NUM_CTX}
+                options=get_llm_options()
             )
             for chunk in stream:
                 print(chunk['message']['content'], end="", flush=True)
