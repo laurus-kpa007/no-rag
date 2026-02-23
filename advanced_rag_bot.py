@@ -264,6 +264,283 @@ def chunk_text(text, size, overlap):
         start = end - overlap
     return chunks
 
+
+# ==========================================
+# 2.5 스마트 섹션 분할 (비정형 문서 전처리)
+# ==========================================
+
+def detect_section_boundaries_by_rules(text):
+    """
+    규칙 기반으로 텍스트의 섹션 경계를 탐지합니다.
+    Returns: list of (start_pos, title) 튜플. 경계가 없으면 빈 리스트.
+    """
+    boundaries = []
+    lines = text.split('\n')
+    pos = 0  # 현재까지의 문자 위치
+
+    # 헤딩 탐지 패턴 (우선순위 순)
+    heading_patterns = [
+        # 마크다운 헤딩
+        (re.compile(r'^(#{1,6})\s+(.+)'), lambda m: m.group(2).strip()),
+        # 한국어 법률/규정 패턴
+        (re.compile(r'^(제\s*\d+\s*장)\s*(.*)'), lambda m: f"{m.group(1)} {m.group(2)}".strip()),
+        (re.compile(r'^(제\s*\d+\s*절)\s*(.*)'), lambda m: f"{m.group(1)} {m.group(2)}".strip()),
+        (re.compile(r'^(제\s*\d+\s*조)\s*(.*)'), lambda m: f"{m.group(1)} {m.group(2)}".strip()),
+        # 번호 매기기 패턴 (최상위 레벨만)
+        (re.compile(r'^(\d+)\.\s+(.{2,50})$'), lambda m: m.group(2).strip()),
+        (re.compile(r'^([IVXLC]+)\.\s+(.{2,50})$'), lambda m: m.group(2).strip()),
+        # 대괄호/괄호 번호 패턴
+        (re.compile(r'^\[(\d+)\]\s+(.{2,50})$'), lambda m: m.group(2).strip()),
+        (re.compile(r'^【(.+?)】'), lambda m: m.group(1).strip()),
+    ]
+
+    # 빈 줄 연속 + 다음 줄이 짧고 강조성 텍스트인 경우 (주제 전환)
+    prev_was_blank = False
+    blank_count = 0
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        line_len = len(line) + 1  # +1 for \n
+
+        # 빈 줄 추적
+        if not stripped:
+            blank_count += 1
+            prev_was_blank = True
+            pos += line_len
+            continue
+
+        # 패턴 매칭으로 헤딩 탐지
+        for pattern, extractor in heading_patterns:
+            m = pattern.match(stripped)
+            if m:
+                title = extractor(m)
+                if title and len(title) >= 2:
+                    boundaries.append((pos, title))
+                break
+        else:
+            # 패턴 매칭 실패 시: 빈 줄 2개 이상 후 짧은 줄 (주제 전환 후보)
+            if blank_count >= 2 and len(stripped) <= 60 and len(stripped) >= 4:
+                # 다음 줄이 존재하고 내용이 있으면 섹션 제목으로 간주
+                if i + 1 < len(lines) and lines[i + 1].strip():
+                    boundaries.append((pos, stripped[:50]))
+
+        blank_count = 0
+        prev_was_blank = False
+        pos += line_len
+
+    return boundaries
+
+
+def split_text_by_boundaries(text, boundaries, min_section_size=200):
+    """
+    탐지된 경계를 기준으로 텍스트를 섹션으로 분할합니다.
+    Returns: list of {'title': str, 'content': str}
+    """
+    if not boundaries:
+        return []
+
+    sections = []
+    for i, (start_pos, title) in enumerate(boundaries):
+        if i + 1 < len(boundaries):
+            end_pos = boundaries[i + 1][0]
+        else:
+            end_pos = len(text)
+
+        content = text[start_pos:end_pos].strip()
+
+        # 너무 짧은 섹션은 다음 섹션과 병합
+        if content and len(content) >= min_section_size:
+            sections.append({'title': title, 'content': content})
+        elif sections:
+            # 이전 섹션에 병합
+            sections[-1]['content'] += '\n\n' + content
+
+    return sections
+
+
+def smart_section_split_llm(text, client=None):
+    """
+    LLM을 사용하여 비정형 문서의 논리적 섹션 경계를 탐지합니다.
+    규칙 기반 탐지가 실패했을 때의 폴백으로 사용됩니다.
+    """
+    if client is None:
+        client = get_ollama_client()
+
+    # 단락 분리
+    paragraphs = re.split(r'\n\s*\n', text)
+    paragraphs = [p.strip() for p in paragraphs if p.strip()]
+
+    if not paragraphs:
+        return []
+
+    # 단락별 미리보기 구성
+    max_input_chars = int(Config.NUM_CTX * Config.MAX_CONTEXT_RATIO * 2)
+    preview_lines = []
+    for i, para in enumerate(paragraphs):
+        preview = para.replace('\n', ' ')[:80]
+        preview_lines.append(f"[{i+1}] {preview}")
+
+    preview_text = "\n".join(preview_lines)
+    if len(preview_text) > max_input_chars:
+        preview_text = preview_text[:max_input_chars]
+
+    prompt = f"""아래는 헤딩이 없는 문서의 단락 목록입니다. 각 단락은 [번호]로 시작합니다.
+
+{preview_text}
+
+이 단락들을 내용의 주제 변화를 기준으로 논리적 섹션으로 묶어주세요.
+각 섹션에 대해 다음 형식으로 출력하세요:
+
+섹션: 섹션 제목
+범위: 시작번호-끝번호
+
+규칙:
+- 모든 단락이 빠짐없이 하나의 섹션에 포함되어야 합니다
+- 범위는 반드시 연속이어야 합니다 (예: 1-5, 6-12, 13-20)
+- 섹션 제목은 해당 단락들의 핵심 주제를 반영하는 간결한 한국어 제목
+- 섹션은 최소 2개 이상으로 나누되, 내용이 단일 주제면 무리하게 나누지 마세요
+- 설명 없이 위 형식으로만 출력하세요"""
+
+    try:
+        res = client.chat(
+            model=Config.MODEL_CHAT,
+            messages=[{'role': 'user', 'content': prompt}],
+            options=get_pageindex_llm_options()
+        )
+        content = res['message']['content'].strip()
+
+        # 응답 파싱
+        sections = []
+        current_title = None
+        for line in content.split('\n'):
+            line = line.strip()
+            if line.startswith('섹션:'):
+                current_title = line.replace('섹션:', '').strip()
+            elif line.startswith('범위:') and current_title:
+                range_str = line.replace('범위:', '').strip()
+                range_str = range_str.replace('~', '-').replace(' ', '')
+                parts = range_str.split('-')
+                if len(parts) == 2:
+                    try:
+                        start = int(parts[0]) - 1
+                        end = int(parts[1])
+                        section_content = "\n\n".join(paragraphs[max(0,start):min(end, len(paragraphs))])
+                        sections.append({'title': current_title, 'content': section_content})
+                    except ValueError:
+                        pass
+                elif len(parts) == 1:
+                    try:
+                        idx = int(parts[0]) - 1
+                        if 0 <= idx < len(paragraphs):
+                            sections.append({'title': current_title, 'content': paragraphs[idx]})
+                    except ValueError:
+                        pass
+                current_title = None
+
+        return sections
+    except Exception as e:
+        print(f"   [SmartSplit] LLM 섹션 분할 실패: {e}")
+        return []
+
+
+def preprocess_document_sections(text, file_path=None):
+    """
+    문서 전처리 통합 함수: 비정형 문서를 포함한 모든 문서에서 논리적 섹션을 추출합니다.
+
+    분할 전략 (순서대로 시도):
+    1. 규칙 기반 헤딩 탐지 (빠르고 비용 없음)
+    2. LLM 보조 논리적 섹션 분할 (규칙 기반 실패 시)
+    3. 문단 경계 기반 분할 (최종 폴백)
+
+    Returns: list of {'title': str, 'content': str}
+    """
+    print("[SmartSplit] 문서 섹션 전처리 시작...")
+
+    # 1단계: 규칙 기반 헤딩 탐지
+    boundaries = detect_section_boundaries_by_rules(text)
+    if boundaries:
+        sections = split_text_by_boundaries(text, boundaries)
+        if len(sections) >= 2:
+            print(f"[SmartSplit] 규칙 기반 분할 성공: {len(sections)}개 섹션 탐지")
+            return sections
+
+    # 2단계: LLM 보조 분할
+    print("[SmartSplit] 규칙 기반 헤딩 미탐지. LLM 보조 섹션 분할을 시도합니다...")
+    sections = smart_section_split_llm(text)
+    if len(sections) >= 2:
+        print(f"[SmartSplit] LLM 보조 분할 성공: {len(sections)}개 섹션 탐지")
+        return sections
+
+    # 3단계: 문단 경계 기반 폴백 (빈 줄 기준)
+    print("[SmartSplit] LLM 분할 실패. 문단 경계 기반 분할로 폴백합니다...")
+    paragraphs = re.split(r'\n\s*\n', text)
+    paragraphs = [p.strip() for p in paragraphs if p.strip()]
+
+    # 너무 작은 문단은 병합하여 적절한 크기의 섹션으로 구성
+    sections = []
+    current_content = []
+    current_size = 0
+    target_size = Config.SUMMARY_CHUNK_SIZE
+
+    for para in paragraphs:
+        current_content.append(para)
+        current_size += len(para)
+
+        if current_size >= target_size:
+            merged = "\n\n".join(current_content)
+            first_line = current_content[0].split('\n')[0][:50]
+            sections.append({
+                'title': first_line if first_line else f"섹션 {len(sections)+1}",
+                'content': merged
+            })
+            current_content = []
+            current_size = 0
+
+    # 남은 내용 처리
+    if current_content:
+        merged = "\n\n".join(current_content)
+        first_line = current_content[0].split('\n')[0][:50]
+        sections.append({
+            'title': first_line if first_line else f"섹션 {len(sections)+1}",
+            'content': merged
+        })
+
+    print(f"[SmartSplit] 문단 기반 분할: {len(sections)}개 섹션")
+    return sections
+
+
+def section_aware_chunk(sections, chunk_size, chunk_overlap):
+    """
+    섹션 경계를 존중하는 청킹. 섹션 내에서만 chunk를 나눕니다.
+    섹션이 chunk_size보다 작으면 그대로 하나의 청크.
+    섹션이 chunk_size보다 크면 섹션 내에서 분할하되, 분할 지점은 문장/문단 경계 우선.
+    """
+    chunks = []
+    for section in sections:
+        content = section['content']
+        title = section['title']
+
+        if len(content) <= chunk_size:
+            # 섹션 제목을 접두사로 추가하여 검색 품질 향상
+            chunks.append(f"[{title}]\n{content}")
+        else:
+            # 섹션 내에서 문단 경계 기반 분할
+            paragraphs = content.split('\n')
+            current_chunk = f"[{title}]\n"
+            for para in paragraphs:
+                if len(current_chunk) + len(para) + 1 > chunk_size and len(current_chunk) > len(title) + 3:
+                    chunks.append(current_chunk.strip())
+                    # 오버랩: 이전 청크 끝부분 포함
+                    overlap_text = current_chunk[-chunk_overlap:] if chunk_overlap > 0 else ""
+                    current_chunk = f"[{title} (계속)]\n{overlap_text}{para}\n"
+                else:
+                    current_chunk += para + "\n"
+
+            if current_chunk.strip() and len(current_chunk) > len(title) + 5:
+                chunks.append(current_chunk.strip())
+
+    return chunks
+
 # ==========================================
 # 3. 검색 엔진 (Retrievers)
 # ==========================================
@@ -645,9 +922,10 @@ class SummaryCache:
         self.section_summaries = []   # 섹션별 요약 리스트
         self.is_ready = False
 
-    def generate(self, full_doc):
+    def generate(self, full_doc, sections=None):
         """
         문서 로드 시 사전 요약을 생성합니다.
+        sections가 제공되면 전처리된 논리적 섹션 경계를 활용합니다.
         """
         print("\n[Pre-Summary] 사전 요약 생성 중... (인덱싱 단계)")
 
@@ -663,31 +941,37 @@ class SummaryCache:
         # 문서가 크면 계층적 요약 수행
         print(f"[Pre-Summary] 문서가 큼({len(full_doc)}자). 계층적 요약을 수행합니다...")
 
-        chunk_size = Config.SUMMARY_CHUNK_SIZE
-        chunks = chunk_text(full_doc, chunk_size, overlap=0)
+        # 전처리된 섹션이 있으면 활용, 없으면 기존 글자수 기반 분할
+        if sections and len(sections) >= 2:
+            print(f"[Pre-Summary] 전처리된 {len(sections)}개 논리적 섹션을 사용합니다.")
+            summary_chunks = [(s['title'], s['content']) for s in sections]
+        else:
+            chunk_size = Config.SUMMARY_CHUNK_SIZE
+            raw_chunks = chunk_text(full_doc, chunk_size, overlap=0)
+            summary_chunks = [(f"섹션 {i+1}", c) for i, c in enumerate(raw_chunks)]
 
-        print(f"[Pre-Summary] {len(chunks)}개 섹션으로 분할")
+        print(f"[Pre-Summary] {len(summary_chunks)}개 섹션으로 분할")
 
         client = get_ollama_client()
         summaries = []
 
-        for i, chunk in enumerate(chunks):
-            print(f"   [Pre-Summary] 섹션 {i+1}/{len(chunks)} 요약 중...")
-            prompt = f"""다음 내용을 3-5문장으로 핵심만 요약하세요.
+        for i, (title, chunk_content) in enumerate(summary_chunks):
+            print(f"   [Pre-Summary] [{title}] ({i+1}/{len(summary_chunks)}) 요약 중...")
+            prompt = f"""다음 섹션의 내용을 3-5문장으로 핵심만 요약하세요.
 중요한 수치, 이름, 용어는 반드시 포함하세요.
 
-내용:
-{chunk}
+[섹션: {title}]
+{chunk_content}
 
 요약:"""
 
             try:
                 res = client.chat(model=Config.MODEL_CHAT, messages=[{'role': 'user', 'content': prompt}], options=get_llm_options())
                 summary = res['message']['content'].strip()
-                summaries.append(f"[섹션 {i+1}]\n{summary}")
+                summaries.append(f"[{title}]\n{summary}")
             except Exception as e:
-                print(f"   [Warning] 섹션 {i+1} 요약 실패: {e}")
-                summaries.append(f"[섹션 {i+1}]\n{chunk[:500]}...")
+                print(f"   [Warning] [{title}] 요약 실패: {e}")
+                summaries.append(f"[{title}]\n{chunk_content[:500]}...")
 
         self.section_summaries = summaries
         combined = "\n\n".join(summaries)
@@ -1706,6 +1990,9 @@ def main():
 
     print(f"\n[System] 문서 로드 성공 ({len(text)}자).")
 
+    # 1.5 문서 전처리: 섹션 경계 탐지 (모든 모드에서 공유)
+    doc_sections = preprocess_document_sections(text, file_path=file_path)
+
     # 2. 캐시 확인 및 인덱싱
     index_cache = IndexCache(file_path)
     vector_store = VectorStore()
@@ -1734,7 +2021,7 @@ def main():
                 summary_cache.is_ready = True
                 print(f"[Cache] 사전 요약 로드 완료 ({len(cached_summary)}자)")
             elif Config.PRE_SUMMARIZE:
-                summary_cache.generate(text)
+                summary_cache.generate(text, sections=doc_sections)
 
             # PageIndex 캐시 로드 시도
             if not pageindex_store.load_from_cache(Config.CACHE_DIR):
@@ -1745,12 +2032,14 @@ def main():
             print("[Cache] 캐시 로드 실패. 새로 인덱싱합니다...")
             index_cache.clear()
             # 아래 else 블록과 동일한 처리
-            chunks = chunk_text(text, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
-            print(f"[System] 총 {len(chunks)}개의 청크 생성됨.")
+            chunks = section_aware_chunk(doc_sections, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
+            if not chunks:
+                chunks = chunk_text(text, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
+            print(f"[System] 총 {len(chunks)}개의 청크 생성됨 (섹션 인식 분할).")
             embeddings = vector_store.add_documents(chunks)
             keyword_store.add_documents(chunks)
             if Config.PRE_SUMMARIZE:
-                summary_cache.generate(text)
+                summary_cache.generate(text, sections=doc_sections)
             index_cache.save(chunks, embeddings, summary_cache.get_summary())
             # PageIndex 빌드
             print("[PageIndex] 인덱스를 구축합니다...")
@@ -1759,8 +2048,10 @@ def main():
     else:
         # 캐시가 없거나 무효화됨 → 새로 인덱싱
         print("[Cache] 캐시 없음 또는 무효화됨. 새로 인덱싱합니다...")
-        chunks = chunk_text(text, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
-        print(f"[System] 총 {len(chunks)}개의 청크 생성됨.")
+        chunks = section_aware_chunk(doc_sections, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
+        if not chunks:
+            chunks = chunk_text(text, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
+        print(f"[System] 총 {len(chunks)}개의 청크 생성됨 (섹션 인식 분할).")
 
         # 벡터 스토어 인덱싱 (임베딩 생성)
         embeddings = vector_store.add_documents(chunks)
@@ -1770,7 +2061,7 @@ def main():
 
         # 사전 요약 생성
         if Config.PRE_SUMMARIZE:
-            summary_cache.generate(text)
+            summary_cache.generate(text, sections=doc_sections)
         else:
             print("[Pre-Summary] 사전 요약 비활성화됨 (Config.PRE_SUMMARIZE=False)")
 
