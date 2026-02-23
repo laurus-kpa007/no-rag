@@ -13,6 +13,14 @@ from rank_bm25 import BM25Okapi
 from docx import Document
 from chromadb.utils import embedding_functions
 
+# Ultra-Precision PageIndex imports
+from pageindex_ultra import PageIndexUltraStore, UltraSearchResult
+from pageindex_ensemble import EnsembleAnswerGenerator, AnswerFormatter
+from pageindex_validators import (
+    EvidenceValidator, ContradictionDetector,
+    CompletenessChecker, CredibilityAssessor
+)
+
 # ==========================================
 # 1. 설정 (Configuration)
 # ==========================================
@@ -2111,10 +2119,11 @@ def main():
         print(" 5. 자동 모드 (Query Router) ★ 추천")
         print(" 6. PageIndex (계층적 목차 탐색) ★ 규정 문서 특화")
         print(" 7. 교차 검증 (Hybrid+Rerank ∩ PageIndex) ★★ 최고 정확도")
+        print(" 8. Ultra-Precision PageIndex ★★★ 최고 정밀도 (느림)")
         print(" q. 종료")
         print("="*40)
 
-        mode = input("검색 모드를 선택하세요 (1-7): ").strip()
+        mode = input("검색 모드를 선택하세요 (1-8): ").strip()
         if mode.lower() in ['q', 'exit']: break
         
         original_query = input("\n질문: ").strip()
@@ -2367,6 +2376,118 @@ def main():
             except Exception as e:
                 print(f"Ollama 오류: {e}")
             continue  # Mode 7은 자체 답변 생성
+
+        elif mode == '8':
+            # === Ultra-Precision PageIndex (Mode 8) ===
+            print("   [Ultra-Precision] Mode 8: 최고 정밀도 PageIndex 검색 시작")
+            print("   ⚠️  이 모드는 15-25회의 LLM 호출을 수행하며, 40-120초 소요됩니다.\n")
+
+            # 방어 코드: PageIndex 인덱스 확인
+            if not pageindex_store.is_ready:
+                print("   [PageIndex] 인덱스가 없습니다. 구축 중...")
+                pageindex_store.build_index(file_path, full_text=text)
+                pageindex_store.save_to_cache(Config.CACHE_DIR)
+
+            # Ultra-Precision 검색 준비
+            try:
+                # 1. PageIndexUltraStore 초기화
+                toc_tree = pageindex_store.toc_tree
+                full_sections = [(node['title'], node['content'])
+                                 for node in pageindex_store._flatten_tree(toc_tree)]
+
+                ultra_store = PageIndexUltraStore(toc_tree, full_sections)
+
+                # 2. Ultra-Precision 검색 실행
+                print("   [Stage 0] Query Analysis...")
+                client = get_ollama_client()
+                ultra_result = ultra_store.search_ultra(query, client, Config)
+
+                # 3. 검색 결과 통계 출력
+                print(f"\n   [Result] {len(ultra_result.sections_collected)}개 섹션 수집")
+                print(f"   [Result] 신뢰도: {ultra_result.confidence:.1f}%")
+                if ultra_result.contradictions:
+                    print(f"   [Warning] {len(ultra_result.contradictions)}개 모순 발견")
+
+                # 4. 앙상블 답변 생성
+                print("\n   [Ensemble] 3가지 전략으로 답변 생성 중...")
+                ensemble_gen = EnsembleAnswerGenerator(client, Config.MODEL_CHAT)
+
+                # 섹션 점수를 딕셔너리로 변환
+                section_scores_dict = [
+                    {
+                        'section_title': score.section_title,
+                        'total_score': score.total_score,
+                        'relevance': score.relevance,
+                        'completeness': score.completeness,
+                        'credibility': score.credibility,
+                        'recency': score.recency
+                    }
+                    for score in ultra_result.section_scores
+                ]
+
+                # 증거 검증 결과를 딕셔너리로 변환
+                evidence_verified = {
+                    ev.section_title: ev.is_verified
+                    for ev in ultra_result.evidence_sentences
+                }
+
+                ensemble_answers = ensemble_gen.generate_ensemble_answers(
+                    query,
+                    ultra_result.sections_collected,
+                    section_scores_dict,
+                    evidence_verified
+                )
+
+                # 5. 최종 종합 답변 생성
+                print("   [Synthesis] 최종 답변 종합 중...\n")
+                synthesized = ensemble_gen.synthesize_answers(
+                    query,
+                    ensemble_answers,
+                    ultra_result.contradictions
+                )
+
+                # 6. 포맷팅된 답변 출력
+                print("\n" + "="*60)
+                formatted_answer = AnswerFormatter.format_ultra_response(
+                    synthesized,
+                    show_details=False  # 상세 정보는 선택적
+                )
+                print(formatted_answer)
+
+                # 7. 추론 과정 출력 (선택적)
+                show_trace = input("\n추론 과정을 보시겠습니까? (y/n): ").strip().lower()
+                if show_trace in ['y', 'yes', 'ㅛ', '예', 'ㅇ']:
+                    trace_output = AnswerFormatter.format_reasoning_trace(
+                        ultra_result.reasoning_trace
+                    )
+                    print(trace_output)
+
+                continue  # Mode 8은 자체 답변 생성을 하므로 아래 공통 답변 생성 건너뜀
+
+            except Exception as e:
+                print(f"\n   ❌ Ultra-Precision 검색 실패: {e}")
+                print(f"   => 일반 PageIndex(Mode 6)로 대체합니다.\n")
+
+                # 폴백: Mode 6 방식으로 처리
+                collected_sections = pageindex_store.search(query)
+                if collected_sections:
+                    collected_sections = pageindex_rerank_sections(query, collected_sections)
+                    prompt_text = pageindex_generate_answer(query, collected_sections)
+
+                    try:
+                        client = ollama.Client(host=Config.OLLAMA_HOST)
+                        stream = client.chat(
+                            model=Config.MODEL_CHAT,
+                            messages=[{'role': 'user', 'content': prompt_text}],
+                            stream=True,
+                            options=get_llm_options()
+                        )
+                        for chunk_data in stream:
+                            print(chunk_data['message']['content'], end="", flush=True)
+                        print()
+                    except Exception as fallback_err:
+                        print(f"폴백 실패: {fallback_err}")
+                continue
 
         else:
             print("잘못된 입력입니다.")
