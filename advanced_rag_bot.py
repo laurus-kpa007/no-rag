@@ -342,13 +342,15 @@ class KeywordStore:
 # ==========================================
 def correct_and_expand_query(query, context_chunks=None):
     """
-    사용자 질문의 오타 교정 + 동의어/키워드 확장을 동시에 수행합니다.
-    한 번의 LLM 호출로 두 가지를 처리하여 효율성을 높입니다.
+    사용자 질문의 오타 교정 + 동의어/키워드 확장 + 유효성 판별을 동시에 수행합니다.
+    한 번의 LLM 호출로 세 가지를 처리하여 효율성을 높입니다.
 
     Returns:
         dict: {
             'corrected': 교정된 질문,
-            'keywords': 확장된 키워드 리스트 (BM25용)
+            'keywords': 확장된 키워드 리스트 (BM25용),
+            'valid': True/False (유효한 질문인지 여부),
+            'reason': 유효하지 않을 경우 사유
         }
     """
     context_instruction = ""
@@ -376,8 +378,13 @@ def correct_and_expand_query(query, context_chunks=None):
 - 조사/어미 제거한 원형
 
 다음 형식으로만 출력하세요:
+유효: [예/아니오] (이 입력이 문서 검색 질문으로 유효한지 판단)
+사유: [아니오인 경우만 - 왜 유효하지 않은지 간단히]
 교정: [교정된 질문]
-키워드: [키워드1, 키워드2, 키워드3, ...]"""
+키워드: [키워드1, 키워드2, 키워드3, ...]
+
+유효하지 않은 입력 예시: 의미 없는 숫자/특수문자만 입력, 한 글자만 입력, 문장이 되지 않는 무작위 글자 나열 등
+유효한 입력 예시: 오타가 있어도 의도를 추측할 수 있는 질문, 단어만 입력해도 검색 의도가 있는 경우"""
 
     try:
         client = get_ollama_client()
@@ -387,10 +394,17 @@ def correct_and_expand_query(query, context_chunks=None):
         # 응답 파싱
         corrected = query
         keywords = []
+        valid = True
+        reason = ""
 
         for line in content.split('\n'):
             line = line.strip()
-            if line.startswith('교정:'):
+            if line.startswith('유효:'):
+                val = line.replace('유효:', '').strip()
+                valid = val.startswith('예') or val.lower().startswith('yes')
+            elif line.startswith('사유:'):
+                reason = line.replace('사유:', '').strip()
+            elif line.startswith('교정:'):
                 corrected = line.replace('교정:', '').strip().replace('"', '').replace("'", "")
             elif line.startswith('키워드:'):
                 kw_str = line.replace('키워드:', '').strip()
@@ -404,12 +418,16 @@ def correct_and_expand_query(query, context_chunks=None):
 
         return {
             'corrected': corrected if corrected else query,
-            'keywords': keywords
+            'keywords': keywords,
+            'valid': valid,
+            'reason': reason
         }
     except:
         return {
             'corrected': query,
-            'keywords': query.split()
+            'keywords': query.split(),
+            'valid': True,  # 오류 시에는 유효한 것으로 간주
+            'reason': ''
         }
 
 
@@ -1489,6 +1507,15 @@ def main():
         query = query_result['corrected']
         expanded_keywords = query_result['keywords']
 
+        # --- 질문 유효성 검증 ---
+        if not query_result.get('valid', True):
+            print(f"\n   ⚠ 질문을 이해하기 어렵습니다: {query_result.get('reason', '입력을 확인해주세요')}")
+            retry = input("   다시 입력하시겠습니까? (y/n): ").strip().lower()
+            if retry in ['y', 'yes', 'ㅛ', '예', 'ㅇ']:
+                continue
+            else:
+                print("   => 입력된 내용으로 검색을 진행합니다.")
+
         if query != original_query:
             print(f"   => 교정된 질문: {query}")
         else:
@@ -1496,7 +1523,7 @@ def main():
         print(f"   => 확장 키워드: {expanded_keywords}")
 
         context = ""
-        
+
         # --- 검색 단계 ---
         if mode == '1':
             context = text # 전체 텍스트
