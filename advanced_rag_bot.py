@@ -1413,7 +1413,9 @@ def main():
 
             # PageIndex 캐시 로드 시도
             if not pageindex_store.load_from_cache(Config.CACHE_DIR):
-                print("[PageIndex] 캐시 없음. 질문 시 자동 빌드됩니다.")
+                print("[PageIndex] 캐시 없음. 인덱스를 구축합니다...")
+                pageindex_store.build_index(file_path, full_text=text)
+                pageindex_store.save_to_cache(Config.CACHE_DIR)
         else:
             print("[Cache] 캐시 로드 실패. 새로 인덱싱합니다...")
             index_cache.clear()
@@ -1425,7 +1427,10 @@ def main():
             if Config.PRE_SUMMARIZE:
                 summary_cache.generate(text)
             index_cache.save(chunks, embeddings, summary_cache.get_summary())
-            print("[PageIndex] 캐시 없음. 질문 시 자동 빌드됩니다.")
+            # PageIndex 빌드
+            print("[PageIndex] 인덱스를 구축합니다...")
+            pageindex_store.build_index(file_path, full_text=text)
+            pageindex_store.save_to_cache(Config.CACHE_DIR)
     else:
         # 캐시가 없거나 무효화됨 → 새로 인덱싱
         print("[Cache] 캐시 없음 또는 무효화됨. 새로 인덱싱합니다...")
@@ -1446,7 +1451,11 @@ def main():
 
         # 캐시 저장
         index_cache.save(chunks, embeddings, summary_cache.get_summary())
-        print("[PageIndex] 질문 시 자동 빌드됩니다.")
+
+        # PageIndex 빌드
+        print("[PageIndex] 인덱스를 구축합니다...")
+        pageindex_store.build_index(file_path, full_text=text)
+        pageindex_store.save_to_cache(Config.CACHE_DIR)
 
     while True:
         print("\n" + "="*40)
@@ -1585,11 +1594,10 @@ def main():
             # === PageIndex 모드 (계층적 목차 탐색 에이전트) ===
             print("   [PageIndex] 계층적 목차 기반 에이전틱 탐색 모드")
 
-            # PageIndex가 아직 빌드되지 않았으면 빌드
+            # 방어 코드: startup에서 빌드되지 않은 예외 상황 대비
             if not pageindex_store.is_ready:
-                print("   [PageIndex] 최초 실행: 문서 인덱스를 구축합니다...")
+                print("   [PageIndex] 인덱스가 없습니다. 구축 중...")
                 pageindex_store.build_index(file_path, full_text=text)
-                # 캐시에 저장
                 pageindex_store.save_to_cache(Config.CACHE_DIR)
 
             # 목차 표시 (선택적)
