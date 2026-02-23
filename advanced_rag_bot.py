@@ -342,13 +342,15 @@ class KeywordStore:
 # ==========================================
 def correct_and_expand_query(query, context_chunks=None):
     """
-    사용자 질문의 오타 교정 + 동의어/키워드 확장을 동시에 수행합니다.
-    한 번의 LLM 호출로 두 가지를 처리하여 효율성을 높입니다.
+    사용자 질문의 오타 교정 + 동의어/키워드 확장 + 유효성 판별을 동시에 수행합니다.
+    한 번의 LLM 호출로 세 가지를 처리하여 효율성을 높입니다.
 
     Returns:
         dict: {
             'corrected': 교정된 질문,
-            'keywords': 확장된 키워드 리스트 (BM25용)
+            'keywords': 확장된 키워드 리스트 (BM25용),
+            'valid': True/False (유효한 질문인지 여부),
+            'reason': 유효하지 않을 경우 사유
         }
     """
     context_instruction = ""
@@ -376,8 +378,13 @@ def correct_and_expand_query(query, context_chunks=None):
 - 조사/어미 제거한 원형
 
 다음 형식으로만 출력하세요:
+유효: [예/아니오] (이 입력이 문서 검색 질문으로 유효한지 판단)
+사유: [아니오인 경우만 - 왜 유효하지 않은지 간단히]
 교정: [교정된 질문]
-키워드: [키워드1, 키워드2, 키워드3, ...]"""
+키워드: [키워드1, 키워드2, 키워드3, ...]
+
+유효하지 않은 입력 예시: 의미 없는 숫자/특수문자만 입력, 한 글자만 입력, 문장이 되지 않는 무작위 글자 나열 등
+유효한 입력 예시: 오타가 있어도 의도를 추측할 수 있는 질문, 단어만 입력해도 검색 의도가 있는 경우"""
 
     try:
         client = get_ollama_client()
@@ -387,10 +394,17 @@ def correct_and_expand_query(query, context_chunks=None):
         # 응답 파싱
         corrected = query
         keywords = []
+        valid = True
+        reason = ""
 
         for line in content.split('\n'):
             line = line.strip()
-            if line.startswith('교정:'):
+            if line.startswith('유효:'):
+                val = line.replace('유효:', '').strip()
+                valid = val.startswith('예') or val.lower().startswith('yes')
+            elif line.startswith('사유:'):
+                reason = line.replace('사유:', '').strip()
+            elif line.startswith('교정:'):
                 corrected = line.replace('교정:', '').strip().replace('"', '').replace("'", "")
             elif line.startswith('키워드:'):
                 kw_str = line.replace('키워드:', '').strip()
@@ -404,12 +418,16 @@ def correct_and_expand_query(query, context_chunks=None):
 
         return {
             'corrected': corrected if corrected else query,
-            'keywords': keywords
+            'keywords': keywords,
+            'valid': valid,
+            'reason': reason
         }
     except:
         return {
             'corrected': query,
-            'keywords': query.split()
+            'keywords': query.split(),
+            'valid': True,  # 오류 시에는 유효한 것으로 간주
+            'reason': ''
         }
 
 
@@ -1413,7 +1431,9 @@ def main():
 
             # PageIndex 캐시 로드 시도
             if not pageindex_store.load_from_cache(Config.CACHE_DIR):
-                print("[PageIndex] 캐시 없음. 질문 시 자동 빌드됩니다.")
+                print("[PageIndex] 캐시 없음. 인덱스를 구축합니다...")
+                pageindex_store.build_index(file_path, full_text=text)
+                pageindex_store.save_to_cache(Config.CACHE_DIR)
         else:
             print("[Cache] 캐시 로드 실패. 새로 인덱싱합니다...")
             index_cache.clear()
@@ -1425,7 +1445,10 @@ def main():
             if Config.PRE_SUMMARIZE:
                 summary_cache.generate(text)
             index_cache.save(chunks, embeddings, summary_cache.get_summary())
-            print("[PageIndex] 캐시 없음. 질문 시 자동 빌드됩니다.")
+            # PageIndex 빌드
+            print("[PageIndex] 인덱스를 구축합니다...")
+            pageindex_store.build_index(file_path, full_text=text)
+            pageindex_store.save_to_cache(Config.CACHE_DIR)
     else:
         # 캐시가 없거나 무효화됨 → 새로 인덱싱
         print("[Cache] 캐시 없음 또는 무효화됨. 새로 인덱싱합니다...")
@@ -1446,7 +1469,11 @@ def main():
 
         # 캐시 저장
         index_cache.save(chunks, embeddings, summary_cache.get_summary())
-        print("[PageIndex] 질문 시 자동 빌드됩니다.")
+
+        # PageIndex 빌드
+        print("[PageIndex] 인덱스를 구축합니다...")
+        pageindex_store.build_index(file_path, full_text=text)
+        pageindex_store.save_to_cache(Config.CACHE_DIR)
 
     while True:
         print("\n" + "="*40)
@@ -1456,10 +1483,11 @@ def main():
         print(" 4. 하이브리드 검색 (Hybrid + Rerank)")
         print(" 5. 자동 모드 (Query Router) ★ 추천")
         print(" 6. PageIndex (계층적 목차 탐색) ★ 규정 문서 특화")
+        print(" 7. 교차 검증 (Hybrid+Rerank ∩ PageIndex) ★★ 최고 정확도")
         print(" q. 종료")
         print("="*40)
 
-        mode = input("검색 모드를 선택하세요 (1-6): ").strip()
+        mode = input("검색 모드를 선택하세요 (1-7): ").strip()
         if mode.lower() in ['q', 'exit']: break
         
         original_query = input("\n질문: ").strip()
@@ -1479,6 +1507,15 @@ def main():
         query = query_result['corrected']
         expanded_keywords = query_result['keywords']
 
+        # --- 질문 유효성 검증 ---
+        if not query_result.get('valid', True):
+            print(f"\n   ⚠ 질문을 이해하기 어렵습니다: {query_result.get('reason', '입력을 확인해주세요')}")
+            retry = input("   다시 입력하시겠습니까? (y/n): ").strip().lower()
+            if retry in ['y', 'yes', 'ㅛ', '예', 'ㅇ']:
+                continue
+            else:
+                print("   => 입력된 내용으로 검색을 진행합니다.")
+
         if query != original_query:
             print(f"   => 교정된 질문: {query}")
         else:
@@ -1486,7 +1523,7 @@ def main():
         print(f"   => 확장 키워드: {expanded_keywords}")
 
         context = ""
-        
+
         # --- 검색 단계 ---
         if mode == '1':
             context = text # 전체 텍스트
@@ -1585,11 +1622,10 @@ def main():
             # === PageIndex 모드 (계층적 목차 탐색 에이전트) ===
             print("   [PageIndex] 계층적 목차 기반 에이전틱 탐색 모드")
 
-            # PageIndex가 아직 빌드되지 않았으면 빌드
+            # 방어 코드: startup에서 빌드되지 않은 예외 상황 대비
             if not pageindex_store.is_ready:
-                print("   [PageIndex] 최초 실행: 문서 인덱스를 구축합니다...")
+                print("   [PageIndex] 인덱스가 없습니다. 구축 중...")
                 pageindex_store.build_index(file_path, full_text=text)
-                # 캐시에 저장
                 pageindex_store.save_to_cache(Config.CACHE_DIR)
 
             # 목차 표시 (선택적)
@@ -1628,6 +1664,77 @@ def main():
             else:
                 context = text[:5000]
                 print(f"[Mode 6] 관련 섹션을 찾지 못함. 문서 앞부분으로 대체합니다.")
+
+        elif mode == '7':
+            # === 교차 검증 모드 (Hybrid+Rerank ∩ PageIndex) ===
+            print("   [CrossVerify] 교차 검증 모드: Hybrid+Rerank와 PageIndex를 동시 수행합니다.")
+
+            # --- 경로 A: Hybrid+Rerank ---
+            print("\n   [경로 A] Hybrid+Rerank 검색 중...")
+            vec_docs = vector_store.search(query, top_k=Config.SEARCH_TOP_K)
+            key_docs = keyword_store.search(query, top_k=Config.SEARCH_TOP_K, expanded_keywords=expanded_keywords)
+            combined_docs = list(set(vec_docs + key_docs))
+            print(f"   [경로 A] 1차 검색 완료 ({len(combined_docs)}개). Reranking...")
+            hybrid_docs = rerank_documents(query, combined_docs)
+            hybrid_context = "\n---\n".join(hybrid_docs)
+            print(f"   [경로 A] Hybrid+Rerank 완료: {len(hybrid_docs)}개 청크")
+
+            # --- 경로 B: PageIndex ---
+            print("\n   [경로 B] PageIndex 에이전틱 탐색 중...")
+            if not pageindex_store.is_ready:
+                print("   [PageIndex] 인덱스가 없습니다. 구축 중...")
+                pageindex_store.build_index(file_path, full_text=text)
+                pageindex_store.save_to_cache(Config.CACHE_DIR)
+
+            pi_sections = pageindex_store.search(query)
+            pi_context_parts = []
+            for section in pi_sections:
+                pi_context_parts.append(
+                    f"[섹션: {section['title']}] (노드ID: {section['node_id']})\n"
+                    f"{section['content']}\n"
+                    f"근거: {section.get('evidence', '해당 섹션 전체 참조')}"
+                )
+            pi_context = "\n\n---\n\n".join(pi_context_parts)
+            print(f"   [경로 B] PageIndex 완료: {len(pi_sections)}개 섹션")
+
+            # --- 교차 검증 답변 생성 ---
+            print(f"\n[Mode 7] 두 경로의 결과를 교차 검증하여 답변 생성 중...\n")
+
+            prompt_text = f"""당신은 사내 규정을 정확히 해석하는 감사관(Auditor)입니다.
+아래에 동일한 질문에 대해 **두 가지 다른 검색 방법**으로 찾은 결과가 있습니다.
+
+[방법 A — 벡터 유사도 + 키워드 검색 결과]
+의미적으로 유사한 텍스트 조각들입니다.
+{hybrid_context}
+
+[방법 B — 목차 기반 계층적 탐색 결과]
+문서의 논리적 구조(목차)를 따라 찾아낸 섹션들입니다.
+{pi_context}
+
+[질문]
+{query}
+
+중요 규칙:
+1. 두 방법의 결과를 **교차 대조**하세요. 양쪽 모두에서 언급되는 내용은 신뢰도가 높습니다.
+2. 한쪽에서만 나온 정보도 근거가 명확하면 포함하되, 출처(방법 A/B)를 표시하세요.
+3. 두 결과가 **상충**하는 경우, 원문에 가까운 쪽을 우선하고 차이점을 명시하세요.
+4. 반드시 **[근거 섹션/청크]**를 인용하여 답변하세요.
+5. 참조 자료에 없는 내용은 답변하지 마세요."""
+
+            try:
+                client = ollama.Client(host=Config.OLLAMA_HOST)
+                stream = client.chat(
+                    model=Config.MODEL_CHAT,
+                    messages=[{'role': 'user', 'content': prompt_text}],
+                    stream=True,
+                    options=get_llm_options()
+                )
+                for chunk_data in stream:
+                    print(chunk_data['message']['content'], end="", flush=True)
+                print()
+            except Exception as e:
+                print(f"Ollama 오류: {e}")
+            continue  # Mode 7은 자체 답변 생성
 
         else:
             print("잘못된 입력입니다.")
