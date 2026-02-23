@@ -1059,8 +1059,9 @@ def pageindex_planning(query, toc_text, client=None):
                 reason = line.split(':', 1)[1].strip()
 
         # ID가 파싱되지 않으면 본문에서 3자리 숫자 패턴 추출
+        # 주의: \b는 한국어 유니코드 문자를 \w로 인식하여 '001과' 같은 패턴에서 실패함
         if not selected_ids:
-            selected_ids = re.findall(r'\b(\d{3})\b', content)
+            selected_ids = re.findall(r'(?<!\d)(\d{3})(?!\d)', content)
 
         return selected_ids[:5], reason, content
     except Exception as e:
@@ -1124,7 +1125,7 @@ def pageindex_inspection(query, section_content, section_title, visited_sections
                     next_ids = [s.strip() for s in ids_str.split(',') if s.strip()]
 
         if not next_ids and not sufficient:
-            next_ids = re.findall(r'\b(\d{3})\b', content)
+            next_ids = re.findall(r'(?<!\d)(\d{3})(?!\d)', content)
 
         return sufficient, evidence, next_ids, content
     except Exception as e:
