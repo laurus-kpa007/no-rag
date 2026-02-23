@@ -1248,19 +1248,123 @@ class PageIndexStore:
         print("[PageIndex] 인덱싱 완료!\n")
 
     def _fallback_chunking(self, text):
-        """헤딩이 없는 문서를 위한 폴백: 일정 크기로 분할하여 가상 섹션 생성"""
+        """헤딩이 없는 문서를 위한 폴백: LLM으로 논리적 섹션을 식별한 뒤 트리를 구축한다.
+        LLM 호출 실패 시 기존 글자 수 기반 분할로 재폴백한다."""
+        print("   [PageIndex] LLM 기반 스마트 섹션 분할을 시도합니다...")
+        try:
+            self._smart_fallback_chunking(text)
+            if self._count_nodes(self.root) > 1:
+                return
+            print("   [PageIndex] 스마트 분할 결과가 부족합니다. 기계적 분할로 전환합니다.")
+        except Exception as e:
+            print(f"   [PageIndex] 스마트 분할 실패 ({e}). 기계적 분할로 전환합니다.")
+
+        # 기존 기계적 분할 (재폴백)
+        self._mechanical_fallback_chunking(text)
+
+    def _mechanical_fallback_chunking(self, text):
+        """기존 글자 수 기반 기계적 분할"""
         chunk_size = 2000
         chunks = chunk_text(text, chunk_size, overlap=100)
         self.root = DocumentNode("000", "문서 전체", level=0)
         for i, chunk in enumerate(chunks):
             node_id = f"{i+1:03d}"
             title = f"섹션 {i+1}"
-            # 첫 줄에서 제목 추출 시도
             first_line = chunk.strip().split('\n')[0][:50]
             if first_line:
                 title = f"섹션 {i+1}: {first_line}"
             node = DocumentNode(node_id, title, level=1, content=chunk)
             self.root.add_child(node)
+
+    def _smart_fallback_chunking(self, text):
+        """LLM 1회 호출로 문서의 논리적 섹션 구조를 추출하여 트리를 구축한다."""
+        # 단락 분리: 빈 줄 기준으로 나누되, 단일 줄바꿈은 보존
+        paragraphs = re.split(r'\n\s*\n', text)
+        paragraphs = [p.strip() for p in paragraphs if p.strip()]
+
+        if not paragraphs:
+            return
+
+        # 단락별 번호 + 미리보기(첫 80자)를 구성하여 LLM에 전달
+        # 컨텍스트 한도를 고려하여 최대 글자 수 제한
+        max_input_chars = int(Config.NUM_CTX * Config.MAX_CONTEXT_RATIO * 2)
+        preview_lines = []
+        for i, para in enumerate(paragraphs):
+            preview = para.replace('\n', ' ')[:80]
+            preview_lines.append(f"[{i+1}] {preview}")
+
+        preview_text = "\n".join(preview_lines)
+        if len(preview_text) > max_input_chars:
+            preview_text = preview_text[:max_input_chars]
+
+        prompt = f"""아래는 헤딩이 없는 문서의 단락 목록입니다. 각 단락은 [번호]로 시작합니다.
+
+{preview_text}
+
+이 단락들을 내용의 주제 변화를 기준으로 논리적 섹션으로 묶어주세요.
+각 섹션에 대해 다음 형식으로 출력하세요:
+
+섹션: 섹션 제목
+범위: 시작번호-끝번호
+
+규칙:
+- 모든 단락이 빠짐없이 하나의 섹션에 포함되어야 합니다
+- 범위는 반드시 연속이어야 합니다 (예: 1-5, 6-12, 13-20)
+- 섹션 제목은 해당 단락들의 핵심 주제를 반영하는 간결한 한국어 제목
+- 섹션은 최소 2개 이상으로 나누되, 내용이 단일 주제면 무리하게 나누지 마세요
+- 설명 없이 위 형식으로만 출력하세요"""
+
+        client = get_ollama_client()
+        res = client.chat(
+            model=Config.MODEL_CHAT,
+            messages=[{'role': 'user', 'content': prompt}],
+            options=get_llm_options()
+        )
+        content = res['message']['content'].strip()
+
+        # 응답 파싱: "섹션:" + "범위:" 쌍을 추출
+        sections = []
+        current_title = None
+        for line in content.split('\n'):
+            line = line.strip()
+            if line.startswith('섹션:'):
+                current_title = line.replace('섹션:', '').strip()
+            elif line.startswith('범위:') and current_title:
+                range_str = line.replace('범위:', '').strip()
+                # "1-5", "1 - 5", "1~5" 등 다양한 형식 처리
+                range_str = range_str.replace('~', '-').replace(' ', '')
+                parts = range_str.split('-')
+                if len(parts) == 2:
+                    try:
+                        start = int(parts[0]) - 1  # 0-indexed
+                        end = int(parts[1])         # exclusive
+                        sections.append((current_title, start, end))
+                    except ValueError:
+                        pass
+                elif len(parts) == 1:
+                    try:
+                        idx = int(parts[0]) - 1
+                        sections.append((current_title, idx, idx + 1))
+                    except ValueError:
+                        pass
+                current_title = None
+
+        if not sections:
+            print("   [PageIndex] LLM 응답에서 섹션을 파싱할 수 없습니다.")
+            return
+
+        # 트리 구축
+        self.root = DocumentNode("000", "문서 전체", level=0)
+        for i, (title, start, end) in enumerate(sections):
+            node_id = f"{i+1:03d}"
+            # 범위 내 단락들을 합쳐서 노드 본문 구성
+            start = max(0, start)
+            end = min(end, len(paragraphs))
+            section_content = "\n\n".join(paragraphs[start:end])
+            node = DocumentNode(node_id, title, level=1, content=section_content)
+            self.root.add_child(node)
+
+        print(f"   [PageIndex] 스마트 분할 완료: {len(sections)}개 섹션 식별")
 
     def _count_nodes(self, node):
         """트리의 전체 노드 수를 세기"""
