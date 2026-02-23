@@ -1977,7 +1977,7 @@ class PageIndexStore:
 # ==========================================
 VERSION = "2.0.0"
 CHANGELOG = """
-  v2.0.0 (2025-02-23)
+  v2.0.0 (2026-02-23)
    - PageIndex 정확도 대폭 개선
      * 조기 종료 제거: planned 섹션 전부 수집 후 추가 탐색 판단
      * 복합 질문 분해(Query Decomposition) 추가
