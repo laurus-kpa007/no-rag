@@ -378,13 +378,13 @@ def correct_and_expand_query(query, context_chunks=None):
 - 조사/어미 제거한 원형
 
 다음 형식으로만 출력하세요:
-유효: [예/아니오] (이 입력이 문서 검색 질문으로 유효한지 판단)
-사유: [아니오인 경우만 - 왜 유효하지 않은지 간단히]
-교정: [교정된 질문]
-키워드: [키워드1, 키워드2, 키워드3, ...]
+유효: 예 또는 아니오
+사유: 아니오인 경우만 간단히 작성
+교정: 교정된 질문
+키워드: 키워드1, 키워드2, 키워드3
 
-유효하지 않은 입력 예시: 의미 없는 숫자/특수문자만 입력, 한 글자만 입력, 문장이 되지 않는 무작위 글자 나열 등
-유효한 입력 예시: 오타가 있어도 의도를 추측할 수 있는 질문, 단어만 입력해도 검색 의도가 있는 경우"""
+유효하지 않은 입력: 의미 없는 숫자/특수문자만, 한 글자만, 무작위 글자 나열
+그 외에는 모두 유효합니다. 오타가 있어도 의도를 추측할 수 있으면 유효, 단어만 입력해도 유효."""
 
     try:
         client = get_ollama_client()
@@ -401,7 +401,11 @@ def correct_and_expand_query(query, context_chunks=None):
             line = line.strip()
             if line.startswith('유효:'):
                 val = line.replace('유효:', '').strip()
-                valid = val.startswith('예') or val.lower().startswith('yes')
+                # 대괄호, 따옴표 등 제거 후 판별
+                val_clean = val.strip('[]()"\' ').lower()
+                # "아니오", "아니", "no" 등 명시적 부정만 invalid 처리
+                invalid_keywords = ('아니오', '아니', 'no', 'x', '×')
+                valid = not any(val_clean.startswith(k) for k in invalid_keywords)
             elif line.startswith('사유:'):
                 reason = line.replace('사유:', '').strip()
             elif line.startswith('교정:'):
