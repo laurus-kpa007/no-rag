@@ -1465,10 +1465,11 @@ def main():
         print(" 4. 하이브리드 검색 (Hybrid + Rerank)")
         print(" 5. 자동 모드 (Query Router) ★ 추천")
         print(" 6. PageIndex (계층적 목차 탐색) ★ 규정 문서 특화")
+        print(" 7. 교차 검증 (Hybrid+Rerank ∩ PageIndex) ★★ 최고 정확도")
         print(" q. 종료")
         print("="*40)
 
-        mode = input("검색 모드를 선택하세요 (1-6): ").strip()
+        mode = input("검색 모드를 선택하세요 (1-7): ").strip()
         if mode.lower() in ['q', 'exit']: break
         
         original_query = input("\n질문: ").strip()
@@ -1636,6 +1637,77 @@ def main():
             else:
                 context = text[:5000]
                 print(f"[Mode 6] 관련 섹션을 찾지 못함. 문서 앞부분으로 대체합니다.")
+
+        elif mode == '7':
+            # === 교차 검증 모드 (Hybrid+Rerank ∩ PageIndex) ===
+            print("   [CrossVerify] 교차 검증 모드: Hybrid+Rerank와 PageIndex를 동시 수행합니다.")
+
+            # --- 경로 A: Hybrid+Rerank ---
+            print("\n   [경로 A] Hybrid+Rerank 검색 중...")
+            vec_docs = vector_store.search(query, top_k=Config.SEARCH_TOP_K)
+            key_docs = keyword_store.search(query, top_k=Config.SEARCH_TOP_K, expanded_keywords=expanded_keywords)
+            combined_docs = list(set(vec_docs + key_docs))
+            print(f"   [경로 A] 1차 검색 완료 ({len(combined_docs)}개). Reranking...")
+            hybrid_docs = rerank_documents(query, combined_docs)
+            hybrid_context = "\n---\n".join(hybrid_docs)
+            print(f"   [경로 A] Hybrid+Rerank 완료: {len(hybrid_docs)}개 청크")
+
+            # --- 경로 B: PageIndex ---
+            print("\n   [경로 B] PageIndex 에이전틱 탐색 중...")
+            if not pageindex_store.is_ready:
+                print("   [PageIndex] 인덱스가 없습니다. 구축 중...")
+                pageindex_store.build_index(file_path, full_text=text)
+                pageindex_store.save_to_cache(Config.CACHE_DIR)
+
+            pi_sections = pageindex_store.search(query)
+            pi_context_parts = []
+            for section in pi_sections:
+                pi_context_parts.append(
+                    f"[섹션: {section['title']}] (노드ID: {section['node_id']})\n"
+                    f"{section['content']}\n"
+                    f"근거: {section.get('evidence', '해당 섹션 전체 참조')}"
+                )
+            pi_context = "\n\n---\n\n".join(pi_context_parts)
+            print(f"   [경로 B] PageIndex 완료: {len(pi_sections)}개 섹션")
+
+            # --- 교차 검증 답변 생성 ---
+            print(f"\n[Mode 7] 두 경로의 결과를 교차 검증하여 답변 생성 중...\n")
+
+            prompt_text = f"""당신은 사내 규정을 정확히 해석하는 감사관(Auditor)입니다.
+아래에 동일한 질문에 대해 **두 가지 다른 검색 방법**으로 찾은 결과가 있습니다.
+
+[방법 A — 벡터 유사도 + 키워드 검색 결과]
+의미적으로 유사한 텍스트 조각들입니다.
+{hybrid_context}
+
+[방법 B — 목차 기반 계층적 탐색 결과]
+문서의 논리적 구조(목차)를 따라 찾아낸 섹션들입니다.
+{pi_context}
+
+[질문]
+{query}
+
+중요 규칙:
+1. 두 방법의 결과를 **교차 대조**하세요. 양쪽 모두에서 언급되는 내용은 신뢰도가 높습니다.
+2. 한쪽에서만 나온 정보도 근거가 명확하면 포함하되, 출처(방법 A/B)를 표시하세요.
+3. 두 결과가 **상충**하는 경우, 원문에 가까운 쪽을 우선하고 차이점을 명시하세요.
+4. 반드시 **[근거 섹션/청크]**를 인용하여 답변하세요.
+5. 참조 자료에 없는 내용은 답변하지 마세요."""
+
+            try:
+                client = ollama.Client(host=Config.OLLAMA_HOST)
+                stream = client.chat(
+                    model=Config.MODEL_CHAT,
+                    messages=[{'role': 'user', 'content': prompt_text}],
+                    stream=True,
+                    options=get_llm_options()
+                )
+                for chunk_data in stream:
+                    print(chunk_data['message']['content'], end="", flush=True)
+                print()
+            except Exception as e:
+                print(f"Ollama 오류: {e}")
+            continue  # Mode 7은 자체 답변 생성
 
         else:
             print("잘못된 입력입니다.")
