@@ -43,8 +43,10 @@ class Config:
     CACHE_DIR = '.rag_cache'      # 캐시 저장 디렉토리
 
     # PageIndex 설정
-    PAGEINDEX_MAX_INSPECT_LOOPS = 3    # 에이전틱 탐색 최대 반복 횟수
-    PAGEINDEX_SUMMARY_MAX_CHARS = 200  # 노드 요약 최대 글자 수
+    PAGEINDEX_MAX_INSPECT_LOOPS = 8    # 에이전틱 탐색 최대 반복 횟수 (선택된 섹션 전부 탐색 보장)
+    PAGEINDEX_SUMMARY_MAX_CHARS = 400  # 노드 요약 최대 글자 수 (핵심 키워드 누락 방지)
+    PAGEINDEX_SECTION_MAX_CHARS = 5000 # Inspection 시 섹션 내용 최대 글자 수
+    PAGEINDEX_TEMPERATURE = 0.2        # PageIndex Planning/Inspection용 낮은 Temperature
 
     # LLM 하이퍼파라미터 설정
     TEMPERATURE = 0.7             # 응답 창의성 (0.0=결정적, 1.0=창의적, 2.0=매우 랜덤)
@@ -64,6 +66,16 @@ def get_llm_options():
         'temperature': Config.TEMPERATURE,
         'top_p': Config.TOP_P,
         'top_k': Config.TOP_K,
+        'repeat_penalty': Config.REPEAT_PENALTY,
+    }
+
+def get_pageindex_llm_options():
+    """PageIndex Planning/Inspection용 낮은 Temperature options"""
+    return {
+        'num_ctx': Config.NUM_CTX,
+        'temperature': Config.PAGEINDEX_TEMPERATURE,
+        'top_p': 0.8,
+        'top_k': 20,
         'repeat_penalty': Config.REPEAT_PENALTY,
     }
 
@@ -1034,6 +1046,64 @@ def find_nodes_by_ids(root, id_list):
     return nodes
 
 
+def decompose_query(query, client=None):
+    """
+    복합 질문을 하위 질문으로 분해합니다.
+    단순 질문은 그대로 반환하고, 복합 질문만 분해합니다.
+    Returns: list of sub-queries (최소 1개, 원본 포함)
+    """
+    if client is None:
+        client = get_ollama_client()
+
+    prompt = f"""다음 질문을 분석하세요. 복합 질문이면 하위 질문으로 분해하고, 단순 질문이면 그대로 출력하세요.
+
+[질문]
+{query}
+
+규칙:
+- 비교 질문 (A와 B의 차이): A에 대한 질문, B에 대한 질문으로 분해
+- 조건부 질문 (A일 때 B는?): 조건 확인 질문, 결과 확인 질문으로 분해
+- 단순 질문 (하나의 정보만 필요): 분해하지 않음
+- 최대 3개까지만 분해
+
+다음 형식으로만 출력하세요:
+복합: Yes 또는 No
+질문1: (첫 번째 하위 질문 또는 원본 질문)
+질문2: (두 번째 하위 질문, 없으면 생략)
+질문3: (세 번째 하위 질문, 없으면 생략)"""
+
+    try:
+        res = client.chat(
+            model=Config.MODEL_CHAT,
+            messages=[{'role': 'user', 'content': prompt}],
+            options=get_pageindex_llm_options()
+        )
+        content = res['message']['content'].strip()
+
+        is_complex = False
+        sub_queries = []
+
+        for line in content.split('\n'):
+            line = line.strip()
+            if line.startswith('복합:') or line.startswith('복합 :'):
+                val = line.split(':', 1)[1].strip().lower()
+                is_complex = 'yes' in val
+            elif line.startswith('질문1:') or line.startswith('질문1 :'):
+                sub_queries.append(line.split(':', 1)[1].strip())
+            elif line.startswith('질문2:') or line.startswith('질문2 :'):
+                sub_queries.append(line.split(':', 1)[1].strip())
+            elif line.startswith('질문3:') or line.startswith('질문3 :'):
+                sub_queries.append(line.split(':', 1)[1].strip())
+
+        if not sub_queries:
+            return [query]
+
+        return sub_queries if is_complex else [query]
+    except Exception as e:
+        print(f"   [PageIndex] 질문 분해 실패: {e}")
+        return [query]
+
+
 def pageindex_planning(query, toc_text, client=None):
     """
     1단계 (Planning): 전체 목차를 보고 질문에 답하기 위해 탐색할 섹션을 결정합니다.
@@ -1064,7 +1134,7 @@ def pageindex_planning(query, toc_text, client=None):
         res = client.chat(
             model=Config.MODEL_CHAT,
             messages=[{'role': 'user', 'content': prompt}],
-            options=get_llm_options()
+            options=get_pageindex_llm_options()
         )
         content = res['message']['content'].strip()
 
@@ -1101,6 +1171,8 @@ def pageindex_inspection(query, section_content, section_title, visited_sections
 
     visited_list = ", ".join(visited_sections) if visited_sections else "없음"
 
+    max_section = Config.PAGEINDEX_SECTION_MAX_CHARS
+
     prompt = f"""당신은 사내 규정집을 조사하는 감사관(Auditor)입니다.
 현재 특정 섹션의 내용을 읽고 있습니다. 사용자의 질문에 충분히 답변할 수 있는지 판단하세요.
 
@@ -1108,7 +1180,7 @@ def pageindex_inspection(query, section_content, section_title, visited_sections
 {query}
 
 [현재 확인 중인 섹션: {section_title}]
-{section_content[:3000]}
+{section_content[:max_section]}
 
 [이미 확인한 섹션들]
 {visited_list}
@@ -1119,13 +1191,13 @@ def pageindex_inspection(query, section_content, section_title, visited_sections
 추가탐색: (No인 경우, 아래 목차에서 추가로 확인할 노드ID. Yes인 경우 "없음")
 
 [참고 목차]
-{toc_text[:2000]}"""
+{toc_text}"""
 
     try:
         res = client.chat(
             model=Config.MODEL_CHAT,
             messages=[{'role': 'user', 'content': prompt}],
-            options=get_llm_options()
+            options=get_pageindex_llm_options()
         )
         content = res['message']['content'].strip()
 
@@ -1153,6 +1225,81 @@ def pageindex_inspection(query, section_content, section_title, visited_sections
     except Exception as e:
         print(f"   [PageIndex] Inspection 실패: {e}")
         return True, "", [], ""
+
+
+def pageindex_rerank_sections(query, collected_sections, client=None):
+    """
+    수집된 섹션들의 관련성을 LLM으로 재평가하여 관련 없는 섹션을 제거합니다.
+    """
+    if not collected_sections or len(collected_sections) <= 1:
+        return collected_sections
+
+    if client is None:
+        client = get_ollama_client()
+
+    print(f"   [PageIndex] Reranking: {len(collected_sections)}개 섹션 관련성 재평가 중...")
+
+    section_list = []
+    for i, section in enumerate(collected_sections):
+        preview = section['content'][:300].replace('\n', ' ')
+        section_list.append(f"[{i+1}] {section['title']}: {preview}...")
+
+    sections_text = "\n".join(section_list)
+
+    prompt = f"""다음은 사용자 질문에 답변하기 위해 수집된 섹션들입니다.
+각 섹션의 관련성을 평가하여 답변에 실제로 필요한 섹션 번호만 선택하세요.
+
+[사용자 질문]
+{query}
+
+[수집된 섹션들]
+{sections_text}
+
+규칙:
+- 질문에 직접 관련된 섹션만 선택
+- 간접적으로라도 답변에 도움이 되면 포함
+- 전혀 관련 없는 섹션만 제외
+
+다음 형식으로만 출력하세요:
+선택: [1, 2, 3] (관련 섹션 번호)"""
+
+    try:
+        res = client.chat(
+            model=Config.MODEL_CHAT,
+            messages=[{'role': 'user', 'content': prompt}],
+            options=get_pageindex_llm_options()
+        )
+        content = res['message']['content'].strip()
+
+        # 선택된 번호 파싱
+        selected_nums = []
+        for line in content.split('\n'):
+            line = line.strip()
+            if line.startswith('선택:') or line.startswith('선택 :'):
+                nums_str = line.split(':', 1)[1].strip()
+                nums_str = nums_str.replace('[', '').replace(']', '')
+                for n in nums_str.split(','):
+                    n = n.strip()
+                    if n.isdigit():
+                        selected_nums.append(int(n))
+
+        if not selected_nums:
+            selected_nums = [int(n) for n in re.findall(r'\d+', content) if 1 <= int(n) <= len(collected_sections)]
+
+        if selected_nums:
+            reranked = [collected_sections[n-1] for n in selected_nums if 1 <= n <= len(collected_sections)]
+            removed = len(collected_sections) - len(reranked)
+            if removed > 0:
+                print(f"   [PageIndex] Reranking 완료: {removed}개 비관련 섹션 제거, {len(reranked)}개 유지")
+            else:
+                print(f"   [PageIndex] Reranking 완료: 모든 섹션 관련성 확인됨")
+            return reranked
+        else:
+            print(f"   [PageIndex] Reranking 파싱 실패, 원본 유지")
+            return collected_sections
+    except Exception as e:
+        print(f"   [PageIndex] Reranking 실패: {e}")
+        return collected_sections
 
 
 def pageindex_generate_answer(query, collected_sections, client=None):
@@ -1382,8 +1529,10 @@ class PageIndexStore:
     def search(self, query):
         """
         에이전틱 추론 탐색을 수행합니다.
-        1단계: Planning - 목차를 보고 탐색할 섹션 결정
-        2단계: Inspection - 섹션 내용을 읽고 충분한지 판단, 부족하면 Loop
+        0단계: Decompose - 복합 질문 분해
+        1단계: Planning - 목차를 보고 탐색할 섹션 결정 (각 하위 질문별)
+        2단계: Collect - Planning에서 선택된 섹션을 모두 수집 (조기 종료 없음)
+        3단계: Expand - 수집 후에도 부족하면 추가 탐색
         """
         if not self.is_ready:
             return []
@@ -1392,26 +1541,34 @@ class PageIndexStore:
         collected_sections = []
         visited_ids = set()
 
-        # 1단계: Planning
-        print("   [PageIndex] 1단계(Planning): 목차에서 관련 섹션 탐색 중...")
-        selected_ids, reason, _ = pageindex_planning(query, self.toc_text, client)
-        print(f"   [PageIndex] 선택된 섹션: {selected_ids}")
-        if reason:
-            print(f"   [PageIndex] 선택 이유: {reason}")
+        # 0단계: 복합 질문 분해
+        sub_queries = decompose_query(query, client)
+        if len(sub_queries) > 1:
+            print(f"   [PageIndex] 0단계(Decompose): 복합 질문 → {len(sub_queries)}개 하위 질문으로 분해")
+            for i, sq in enumerate(sub_queries):
+                print(f"     질문{i+1}: {sq}")
+
+        # 1단계: Planning (각 하위 질문별로 섹션 선택 후 합산)
+        all_selected_ids = []
+        for sq in sub_queries:
+            print(f"   [PageIndex] 1단계(Planning): '{sq[:40]}...' 관련 섹션 탐색 중...")
+            selected_ids, reason, _ = pageindex_planning(sq, self.toc_text, client)
+            print(f"   [PageIndex] 선택된 섹션: {selected_ids}")
+            if reason:
+                print(f"   [PageIndex] 선택 이유: {reason}")
+            all_selected_ids.extend(selected_ids)
+
+        # 중복 제거하면서 순서 보존
+        selected_ids = list(dict.fromkeys(all_selected_ids))
 
         if not selected_ids:
             print("   [PageIndex] 관련 섹션을 찾지 못함. 루트 노드의 자식들을 사용합니다.")
             selected_ids = [c.node_id for c in self.root.children[:3]]
 
-        # 2단계: Inspection Loop
-        max_loops = Config.PAGEINDEX_MAX_INSPECT_LOOPS
-        loop_count = 0
-        pending_ids = list(selected_ids)
-
-        while pending_ids and loop_count < max_loops:
-            loop_count += 1
-            current_id = pending_ids.pop(0)
-
+        # 2단계: Planned 섹션 전부 수집 (조기 종료 없이 모두 수집)
+        print(f"   [PageIndex] 2단계(Collect): 선택된 {len(selected_ids)}개 섹션 전체 수집...")
+        all_evidence = []
+        for current_id in selected_ids:
             if current_id in visited_ids:
                 continue
             visited_ids.add(current_id)
@@ -1422,8 +1579,9 @@ class PageIndexStore:
                 continue
 
             section_content = node.get_full_content()
-            print(f"   [PageIndex] 2단계(Inspection #{loop_count}): [{node.node_id}] {node.title} 분석 중...")
+            print(f"   [PageIndex] 수집: [{node.node_id}] {node.title}")
 
+            # Inspection으로 근거 문장 추출 (충분성 판단은 수집 단계에서는 무시)
             sufficient, evidence, next_ids, _ = pageindex_inspection(
                 query, section_content, node.title,
                 [f"[{nid}]" for nid in visited_ids],
@@ -1433,21 +1591,62 @@ class PageIndexStore:
             collected_sections.append({
                 'node_id': node.node_id,
                 'title': node.title,
-                'content': section_content[:3000],
+                'content': section_content[:Config.PAGEINDEX_SECTION_MAX_CHARS],
                 'evidence': evidence,
             })
+            all_evidence.append(evidence)
 
-            if sufficient:
-                print(f"   [PageIndex] 충분한 정보 확보 완료!")
-                break
-            else:
-                # 아직 확인하지 않은 섹션만 추가
+        # 3단계: 추가 탐색 (Expand) — 수집된 섹션으로 부족할 때만 추가 탐색
+        max_expand_loops = Config.PAGEINDEX_MAX_INSPECT_LOOPS - len(selected_ids)
+        if max_expand_loops > 0 and collected_sections:
+            print(f"   [PageIndex] 3단계(Expand): 추가 탐색 필요 여부 확인 중...")
+            # 마지막 Inspection에서 제안된 추가 섹션이 있으면 탐색
+            last_section = collected_sections[-1]
+            _, _, expand_ids, _ = pageindex_inspection(
+                query, "\n\n".join(all_evidence), "수집된 전체 근거",
+                [f"[{nid}]" for nid in visited_ids],
+                self.toc_text, client
+            )
+            pending_expand = [nid for nid in expand_ids if nid not in visited_ids]
+
+            expand_count = 0
+            while pending_expand and expand_count < max_expand_loops:
+                expand_count += 1
+                current_id = pending_expand.pop(0)
+
+                if current_id in visited_ids:
+                    continue
+                visited_ids.add(current_id)
+
+                node = find_node_by_id(self.root, current_id)
+                if not node:
+                    continue
+
+                section_content = node.get_full_content()
+                print(f"   [PageIndex] 추가 탐색 #{expand_count}: [{node.node_id}] {node.title}")
+
+                sufficient, evidence, next_ids, _ = pageindex_inspection(
+                    query, section_content, node.title,
+                    [f"[{nid}]" for nid in visited_ids],
+                    self.toc_text, client
+                )
+
+                collected_sections.append({
+                    'node_id': node.node_id,
+                    'title': node.title,
+                    'content': section_content[:Config.PAGEINDEX_SECTION_MAX_CHARS],
+                    'evidence': evidence,
+                })
+
+                if sufficient:
+                    print(f"   [PageIndex] 추가 탐색 후 충분한 정보 확보!")
+                    break
+
                 new_ids = [nid for nid in next_ids if nid not in visited_ids]
                 if new_ids:
-                    print(f"   [PageIndex] 추가 탐색 필요: {new_ids}")
-                    pending_ids = new_ids + pending_ids
+                    pending_expand = new_ids + pending_expand
 
-        print(f"   [PageIndex] 총 {len(collected_sections)}개 섹션 수집 완료 (탐색 {loop_count}회)")
+        print(f"   [PageIndex] 총 {len(collected_sections)}개 섹션 수집 완료")
         return collected_sections
 
     def get_toc(self):
@@ -1749,6 +1948,10 @@ def main():
             print(f"\n   [PageIndex] 에이전틱 추론 탐색 시작...")
             collected_sections = pageindex_store.search(query)
 
+            # Reranking: 비관련 섹션 제거
+            if collected_sections:
+                collected_sections = pageindex_rerank_sections(query, collected_sections)
+
             if collected_sections:
                 # PageIndex 전용 답변 생성 프롬프트
                 prompt_text = pageindex_generate_answer(query, collected_sections)
@@ -1795,6 +1998,7 @@ def main():
                 pageindex_store.save_to_cache(Config.CACHE_DIR)
 
             pi_sections = pageindex_store.search(query)
+            pi_sections = pageindex_rerank_sections(query, pi_sections)
             pi_context_parts = []
             for section in pi_sections:
                 pi_context_parts.append(
