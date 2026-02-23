@@ -6,6 +6,7 @@ import sys
 import json
 import pickle
 import hashlib
+import re
 import ollama
 import chromadb
 from rank_bm25 import BM25Okapi
@@ -40,6 +41,10 @@ class Config:
     # 캐시 설정
     CACHE_ENABLED = True          # 임베딩 캐시 사용 여부
     CACHE_DIR = '.rag_cache'      # 캐시 저장 디렉토리
+
+    # PageIndex 설정
+    PAGEINDEX_MAX_INSPECT_LOOPS = 3    # 에이전틱 탐색 최대 반복 횟수
+    PAGEINDEX_SUMMARY_MAX_CHARS = 200  # 노드 요약 최대 글자 수
 
     # LLM 하이퍼파라미터 설정
     TEMPERATURE = 0.7             # 응답 창의성 (0.0=결정적, 1.0=창의적, 2.0=매우 랜덤)
@@ -680,7 +685,685 @@ class SummaryCache:
         return None
 
 # ==========================================
-# 6. 메인 로직
+# 6. PageIndex 모드 (계층적 문서 탐색 에이전트)
+# ==========================================
+
+class DocumentNode:
+    """
+    문서 트리의 노드. 각 노드는 섹션(Heading) 또는 최상위 문서를 나타냅니다.
+    [부모 섹션 - 자식 문단] 관계를 가진 트리 구조를 형성합니다.
+    """
+    def __init__(self, node_id, title, level, content=""):
+        self.node_id = node_id          # 고유 ID (예: "001", "001-002")
+        self.title = title              # 섹션 제목
+        self.level = level              # 헤딩 레벨 (0=루트, 1=Heading1, 2=Heading2, ...)
+        self.content = content          # 이 섹션의 직속 본문 (하위 섹션 제외)
+        self.children = []              # 자식 노드 리스트
+        self.summary = ""               # LLM 생성 요약
+
+    def add_child(self, child_node):
+        self.children.append(child_node)
+
+    def get_full_content(self):
+        """이 노드와 모든 자식의 본문을 포함한 전체 텍스트 반환"""
+        parts = []
+        if self.content.strip():
+            parts.append(self.content.strip())
+        for child in self.children:
+            parts.append(f"\n[{child.title}]\n{child.get_full_content()}")
+        return "\n".join(parts)
+
+    def to_dict(self):
+        """직렬화용 딕셔너리 변환"""
+        return {
+            'node_id': self.node_id,
+            'title': self.title,
+            'level': self.level,
+            'content': self.content,
+            'summary': self.summary,
+            'children': [c.to_dict() for c in self.children],
+        }
+
+    @staticmethod
+    def from_dict(d):
+        """딕셔너리에서 DocumentNode 복원"""
+        node = DocumentNode(d['node_id'], d['title'], d['level'], d['content'])
+        node.summary = d.get('summary', '')
+        for cd in d.get('children', []):
+            node.add_child(DocumentNode.from_dict(cd))
+        return node
+
+
+def parse_docx_to_tree(file_path):
+    """
+    python-docx를 사용하여 .docx 문서를 계층적 트리 구조로 파싱합니다.
+    Heading 스타일을 기준으로 [부모 섹션 - 자식 문단] 관계를 구성합니다.
+    표(Table)도 해당 섹션의 본문으로 포함됩니다.
+    """
+    doc = Document(file_path)
+    root = DocumentNode("000", "문서 전체", level=0)
+    node_counter = [0]  # 리스트로 감싸서 클로저에서 수정 가능하게
+
+    def next_id():
+        node_counter[0] += 1
+        return f"{node_counter[0]:03d}"
+
+    # 문서의 모든 블록 요소(paragraph, table)를 순서대로 순회
+    # python-docx의 element.body에서 순서를 보장하기 위해 XML 레벨에서 접근
+    from docx.oxml.ns import qn
+
+    body = doc.element.body
+    elements = []  # (type, obj) 튜플 리스트
+
+    for child in body:
+        tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+        if tag == 'p':
+            # Paragraph
+            for para in doc.paragraphs:
+                if para._element is child:
+                    elements.append(('paragraph', para))
+                    break
+        elif tag == 'tbl':
+            # Table
+            for table in doc.tables:
+                if table._element is child:
+                    elements.append(('table', table))
+                    break
+
+    # 스택 기반으로 계층 구조 구축
+    # stack[i] = 현재 레벨 i에서의 활성 노드
+    stack = {0: root}
+    current_parent = root
+    current_content_parts = []  # 현재 노드에 쌓이는 본문
+
+    def flush_content():
+        """현재 쌓인 본문을 현재 부모 노드에 추가"""
+        nonlocal current_content_parts
+        if current_content_parts:
+            text = "\n".join(current_content_parts)
+            current_parent.content += ("\n" + text) if current_parent.content else text
+            current_content_parts = []
+
+    def get_heading_level(paragraph):
+        """Paragraph의 Heading 레벨을 반환. Heading이 아니면 0 반환."""
+        style_name = paragraph.style.name if paragraph.style else ""
+        if style_name.startswith('Heading'):
+            try:
+                return int(style_name.replace('Heading', '').strip())
+            except ValueError:
+                return 0
+        # 한국어 스타일 처리
+        if '제목' in style_name:
+            for ch in style_name:
+                if ch.isdigit():
+                    return int(ch)
+            return 1
+        return 0
+
+    def table_to_text(table):
+        """Table 객체를 텍스트로 변환"""
+        rows_text = []
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells]
+            rows_text.append(" | ".join(cells))
+        return "\n".join(rows_text)
+
+    for elem_type, elem in elements:
+        if elem_type == 'paragraph':
+            heading_level = get_heading_level(elem)
+            text = elem.text.strip()
+
+            if heading_level > 0 and text:
+                # 새로운 Heading 발견 → 이전 본문을 flush하고 새 노드 생성
+                flush_content()
+
+                new_node = DocumentNode(next_id(), text, heading_level)
+
+                # 적절한 부모를 찾음: 현재 레벨보다 낮은(상위) 레벨의 노드
+                parent_level = heading_level - 1
+                while parent_level >= 0 and parent_level not in stack:
+                    parent_level -= 1
+
+                parent = stack.get(parent_level, root)
+                parent.add_child(new_node)
+
+                # 스택 업데이트: 현재 레벨에 새 노드 설정
+                stack[heading_level] = new_node
+                # 현재 레벨보다 높은(하위) 레벨의 스택 항목 제거
+                for lvl in list(stack.keys()):
+                    if lvl > heading_level:
+                        del stack[lvl]
+
+                current_parent = new_node
+            else:
+                # 일반 본문 텍스트
+                if text:
+                    current_content_parts.append(text)
+
+        elif elem_type == 'table':
+            table_text = table_to_text(elem)
+            if table_text.strip():
+                current_content_parts.append(f"[표]\n{table_text}")
+
+    # 마지막 남은 본문 flush
+    flush_content()
+
+    return root
+
+
+def parse_text_to_tree(text):
+    """
+    일반 텍스트(.md, .txt)를 계층적 트리로 파싱합니다.
+    마크다운 헤딩(#, ##, ###)이나 번호 패턴(제1장, 제1조 등)을 기준으로 구조화합니다.
+    """
+    root = DocumentNode("000", "문서 전체", level=0)
+    node_counter = [0]
+
+    def next_id():
+        node_counter[0] += 1
+        return f"{node_counter[0]:03d}"
+
+    lines = text.split('\n')
+    stack = {0: root}
+    current_parent = root
+    current_content_parts = []
+
+    # 헤딩 패턴 정의
+    heading_patterns = [
+        (re.compile(r'^(#{1,6})\s+(.+)'), lambda m: (len(m.group(1)), m.group(2).strip())),
+        (re.compile(r'^(제\s*\d+\s*장)\s*(.*)'), lambda m: (1, f"{m.group(1)} {m.group(2)}".strip())),
+        (re.compile(r'^(제\s*\d+\s*절)\s*(.*)'), lambda m: (2, f"{m.group(1)} {m.group(2)}".strip())),
+        (re.compile(r'^(제\s*\d+\s*조)\s*(.*)'), lambda m: (3, f"{m.group(1)} {m.group(2)}".strip())),
+    ]
+
+    def detect_heading(line):
+        """줄이 헤딩인지 판별. (level, title) 반환, 아니면 None"""
+        stripped = line.strip()
+        for pattern, extractor in heading_patterns:
+            m = pattern.match(stripped)
+            if m:
+                return extractor(m)
+        return None
+
+    def flush():
+        nonlocal current_content_parts
+        if current_content_parts:
+            t = "\n".join(current_content_parts)
+            current_parent.content += ("\n" + t) if current_parent.content else t
+            current_content_parts = []
+
+    for line in lines:
+        heading = detect_heading(line)
+        if heading:
+            flush()
+            level, title = heading
+            new_node = DocumentNode(next_id(), title, level)
+
+            parent_level = level - 1
+            while parent_level >= 0 and parent_level not in stack:
+                parent_level -= 1
+            parent = stack.get(parent_level, root)
+            parent.add_child(new_node)
+
+            stack[level] = new_node
+            for lvl in list(stack.keys()):
+                if lvl > level:
+                    del stack[lvl]
+            current_parent = new_node
+        else:
+            if line.strip():
+                current_content_parts.append(line.strip())
+
+    flush()
+    return root
+
+
+def generate_node_summaries(node, client=None, depth=0):
+    """
+    트리의 각 노드에 대해 LLM을 사용하여 요약을 생성합니다.
+    리프 노드부터 상향식(Bottom-up)으로 요약을 생성합니다.
+    """
+    if client is None:
+        client = get_ollama_client()
+
+    # 먼저 자식 노드들의 요약을 재귀적으로 생성
+    for child in node.children:
+        generate_node_summaries(child, client, depth + 1)
+
+    # 루트 노드는 특별 처리
+    if node.level == 0:
+        child_summaries = "\n".join([f"- {c.title}: {c.summary}" for c in node.children if c.summary])
+        node.summary = f"이 문서는 {len(node.children)}개의 주요 섹션으로 구성됨. " + child_summaries[:500]
+        return
+
+    # 요약할 내용 구성
+    content_for_summary = node.content[:1000] if node.content else ""
+    if node.children:
+        child_info = "\n".join([f"- 하위섹션 [{c.title}]: {c.summary[:100]}" for c in node.children if c.summary])
+        content_for_summary += f"\n\n하위 섹션:\n{child_info}"
+
+    if not content_for_summary.strip():
+        node.summary = f"[{node.title}] 섹션 (내용 없음)"
+        return
+
+    max_chars = Config.PAGEINDEX_SUMMARY_MAX_CHARS
+    prompt = f"""다음 섹션의 내용을 {max_chars}자 이내로 요약하세요.
+핵심 키워드, 규정/조항 번호, 중요 수치를 반드시 포함하세요.
+설명 없이 요약만 출력하세요.
+
+[섹션 제목] {node.title}
+
+[내용]
+{content_for_summary}
+
+요약:"""
+
+    try:
+        res = client.chat(
+            model=Config.MODEL_CHAT,
+            messages=[{'role': 'user', 'content': prompt}],
+            options=get_llm_options()
+        )
+        node.summary = res['message']['content'].strip()[:max_chars]
+        indent = "  " * depth
+        print(f"   {indent}[PageIndex] 노드 요약 완료: [{node.node_id}] {node.title}")
+    except Exception as e:
+        node.summary = content_for_summary[:max_chars]
+        print(f"   [PageIndex] 요약 실패 ({node.title}): {e}")
+
+
+def build_table_of_contents(node, depth=0):
+    """
+    트리를 LLM이 읽을 수 있는 목차(Table of Contents) 형태로 변환합니다.
+    각 항목에 노드 ID와 요약을 포함합니다.
+    """
+    lines = []
+    indent = "  " * depth
+
+    if node.level > 0:
+        summary_text = node.summary if node.summary else "(요약 없음)"
+        lines.append(f"{indent}[{node.node_id}] {node.title} — {summary_text}")
+
+    for child in node.children:
+        lines.extend(build_table_of_contents(child, depth + 1))
+
+    return lines
+
+
+def find_node_by_id(node, target_id):
+    """노드 ID로 트리에서 특정 노드를 찾습니다."""
+    if node.node_id == target_id:
+        return node
+    for child in node.children:
+        result = find_node_by_id(child, target_id)
+        if result:
+            return result
+    return None
+
+
+def find_nodes_by_ids(root, id_list):
+    """여러 노드 ID로 노드들을 찾아 반환합니다."""
+    nodes = []
+    for nid in id_list:
+        nid = nid.strip()
+        found = find_node_by_id(root, nid)
+        if found:
+            nodes.append(found)
+    return nodes
+
+
+def pageindex_planning(query, toc_text, client=None):
+    """
+    1단계 (Planning): 전체 목차를 보고 질문에 답하기 위해 탐색할 섹션을 결정합니다.
+    LLM이 '감사관(Auditor)'의 페르소나로 목차를 훑어보고 관련 섹션 ID를 반환합니다.
+    """
+    if client is None:
+        client = get_ollama_client()
+
+    prompt = f"""당신은 사내 규정집의 목차를 보고 필요한 조항을 스스로 찾아가는 숙련된 감사관(Auditor)입니다.
+벡터 유사도가 아닌, 문서의 논리적 위치를 근거로 판단합니다.
+
+아래는 규정 문서의 전체 목차입니다. 각 항목은 [노드ID] 제목 — 요약 형식입니다.
+
+[문서 목차]
+{toc_text}
+
+[사용자 질문]
+{query}
+
+위 질문에 답변하기 위해 반드시 확인해야 할 섹션의 노드ID를 선택하세요.
+관련성이 높은 순서로 최대 5개까지 선택하세요.
+
+다음 형식으로만 출력하세요:
+선택: [노드ID1, 노드ID2, 노드ID3]
+이유: (각 섹션을 선택한 이유를 한 줄로 설명)"""
+
+    try:
+        res = client.chat(
+            model=Config.MODEL_CHAT,
+            messages=[{'role': 'user', 'content': prompt}],
+            options=get_llm_options()
+        )
+        content = res['message']['content'].strip()
+
+        # 선택된 노드 ID 파싱
+        selected_ids = []
+        reason = ""
+        for line in content.split('\n'):
+            line = line.strip()
+            if line.startswith('선택:') or line.startswith('선택 :'):
+                ids_str = line.split(':', 1)[1].strip()
+                ids_str = ids_str.replace('[', '').replace(']', '')
+                selected_ids = [s.strip() for s in ids_str.split(',') if s.strip()]
+            elif line.startswith('이유:') or line.startswith('이유 :'):
+                reason = line.split(':', 1)[1].strip()
+
+        # ID가 파싱되지 않으면 본문에서 3자리 숫자 패턴 추출
+        if not selected_ids:
+            selected_ids = re.findall(r'\b(\d{3})\b', content)
+
+        return selected_ids[:5], reason, content
+    except Exception as e:
+        print(f"   [PageIndex] Planning 실패: {e}")
+        return [], "", ""
+
+
+def pageindex_inspection(query, section_content, section_title, visited_sections, toc_text, client=None):
+    """
+    2단계 (Inspection): 선택된 섹션의 내용을 읽고 답변 충분성을 판단합니다.
+    부족하면 다음에 탐색할 섹션을 제안합니다.
+    """
+    if client is None:
+        client = get_ollama_client()
+
+    visited_list = ", ".join(visited_sections) if visited_sections else "없음"
+
+    prompt = f"""당신은 사내 규정집을 조사하는 감사관(Auditor)입니다.
+현재 특정 섹션의 내용을 읽고 있습니다. 사용자의 질문에 충분히 답변할 수 있는지 판단하세요.
+
+[사용자 질문]
+{query}
+
+[현재 확인 중인 섹션: {section_title}]
+{section_content[:3000]}
+
+[이미 확인한 섹션들]
+{visited_list}
+
+판단 결과를 다음 형식으로 출력하세요:
+충분: Yes 또는 No
+근거문장: (답변의 근거가 되는 핵심 문장을 원문에서 인용)
+추가탐색: (No인 경우, 아래 목차에서 추가로 확인할 노드ID. Yes인 경우 "없음")
+
+[참고 목차]
+{toc_text[:2000]}"""
+
+    try:
+        res = client.chat(
+            model=Config.MODEL_CHAT,
+            messages=[{'role': 'user', 'content': prompt}],
+            options=get_llm_options()
+        )
+        content = res['message']['content'].strip()
+
+        sufficient = False
+        evidence = ""
+        next_ids = []
+
+        for line in content.split('\n'):
+            line = line.strip()
+            if line.startswith('충분:') or line.startswith('충분 :'):
+                val = line.split(':', 1)[1].strip().lower()
+                sufficient = 'yes' in val
+            elif line.startswith('근거문장:') or line.startswith('근거문장 :'):
+                evidence = line.split(':', 1)[1].strip()
+            elif line.startswith('추가탐색:') or line.startswith('추가탐색 :'):
+                ids_str = line.split(':', 1)[1].strip()
+                if ids_str != '없음' and ids_str:
+                    ids_str = ids_str.replace('[', '').replace(']', '')
+                    next_ids = [s.strip() for s in ids_str.split(',') if s.strip()]
+
+        if not next_ids and not sufficient:
+            next_ids = re.findall(r'\b(\d{3})\b', content)
+
+        return sufficient, evidence, next_ids, content
+    except Exception as e:
+        print(f"   [PageIndex] Inspection 실패: {e}")
+        return True, "", [], ""
+
+
+def pageindex_generate_answer(query, collected_sections, client=None):
+    """
+    수집된 섹션 정보를 기반으로 최종 답변을 생성합니다.
+    모든 답변에 [섹션 제목]과 [근거 문장]을 포함합니다.
+    """
+    if client is None:
+        client = get_ollama_client()
+
+    # 수집된 섹션들을 컨텍스트로 구성
+    context_parts = []
+    for section in collected_sections:
+        context_parts.append(
+            f"[섹션: {section['title']}] (노드ID: {section['node_id']})\n"
+            f"{section['content']}\n"
+            f"근거: {section.get('evidence', '해당 섹션 전체 참조')}"
+        )
+
+    context = "\n\n---\n\n".join(context_parts)
+
+    prompt = f"""당신은 사내 규정을 정확히 해석하는 감사관(Auditor)입니다.
+아래의 [참조 섹션]들을 근거로 사용자의 질문에 답변하세요.
+
+중요 규칙:
+1. 반드시 답변의 근거가 되는 **[섹션 제목]**을 명시하세요.
+2. 핵심 내용은 원문의 **[근거 문장]**을 직접 인용하세요.
+3. 참조 섹션에 없는 내용은 답변하지 마세요.
+4. 벡터 유사도가 아닌, 문서의 논리적 위치(목차 구조)를 통해 찾아낸 정보임을 전제하세요.
+
+[참조 섹션]
+{context}
+
+[질문]
+{query}"""
+
+    return prompt
+
+
+class PageIndexStore:
+    """
+    PageIndex 모드의 핵심 저장소.
+    문서를 계층적 트리로 파싱하고, 노드 요약을 생성하며,
+    에이전틱 추론 탐색을 수행합니다.
+    """
+    def __init__(self):
+        self.root = None              # DocumentNode 트리 루트
+        self.toc_text = ""            # LLM용 목차 텍스트
+        self.is_ready = False
+
+    def build_index(self, file_path, full_text=None):
+        """
+        문서를 파싱하여 트리 구조를 구축하고 노드 요약을 생성합니다.
+        """
+        print("\n[PageIndex] 계층적 문서 인덱싱 시작...")
+
+        ext = os.path.splitext(file_path)[1].lower()
+
+        # 1단계: 문서 → 트리 구조 파싱
+        print("   [PageIndex] 1단계: 문서를 트리 구조로 파싱 중...")
+        if ext == '.docx':
+            self.root = parse_docx_to_tree(file_path)
+        else:
+            # .md, .txt 등은 텍스트 기반 파싱
+            if full_text is None:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    full_text = f.read()
+            self.root = parse_text_to_tree(full_text)
+
+        # 트리 통계 출력
+        total_nodes = self._count_nodes(self.root)
+        max_depth = self._max_depth(self.root)
+        print(f"   [PageIndex] 트리 구축 완료: {total_nodes}개 노드, 최대 깊이 {max_depth}")
+
+        # 노드가 하나도 없으면 (헤딩이 없는 문서) 폴백
+        if total_nodes <= 1 and full_text:
+            print("   [PageIndex] 헤딩이 감지되지 않음. 텍스트를 청크 단위로 분할합니다...")
+            self._fallback_chunking(full_text)
+            total_nodes = self._count_nodes(self.root)
+            print(f"   [PageIndex] 폴백 분할 완료: {total_nodes}개 노드")
+
+        # 2단계: 각 노드 요약 생성
+        print("   [PageIndex] 2단계: 노드 요약 생성 중... (LLM 호출)")
+        generate_node_summaries(self.root)
+
+        # 3단계: 목차 생성
+        print("   [PageIndex] 3단계: 목차 구성 중...")
+        toc_lines = build_table_of_contents(self.root)
+        self.toc_text = "\n".join(toc_lines)
+        print(f"   [PageIndex] 목차 생성 완료 ({len(toc_lines)}개 항목)")
+
+        self.is_ready = True
+        print("[PageIndex] 인덱싱 완료!\n")
+
+    def _fallback_chunking(self, text):
+        """헤딩이 없는 문서를 위한 폴백: 일정 크기로 분할하여 가상 섹션 생성"""
+        chunk_size = 2000
+        chunks = chunk_text(text, chunk_size, overlap=100)
+        self.root = DocumentNode("000", "문서 전체", level=0)
+        for i, chunk in enumerate(chunks):
+            node_id = f"{i+1:03d}"
+            title = f"섹션 {i+1}"
+            # 첫 줄에서 제목 추출 시도
+            first_line = chunk.strip().split('\n')[0][:50]
+            if first_line:
+                title = f"섹션 {i+1}: {first_line}"
+            node = DocumentNode(node_id, title, level=1, content=chunk)
+            self.root.add_child(node)
+
+    def _count_nodes(self, node):
+        """트리의 전체 노드 수를 세기"""
+        count = 1
+        for child in node.children:
+            count += self._count_nodes(child)
+        return count
+
+    def _max_depth(self, node, current=0):
+        """트리의 최대 깊이"""
+        if not node.children:
+            return current
+        return max(self._max_depth(c, current + 1) for c in node.children)
+
+    def search(self, query):
+        """
+        에이전틱 추론 탐색을 수행합니다.
+        1단계: Planning - 목차를 보고 탐색할 섹션 결정
+        2단계: Inspection - 섹션 내용을 읽고 충분한지 판단, 부족하면 Loop
+        """
+        if not self.is_ready:
+            return []
+
+        client = get_ollama_client()
+        collected_sections = []
+        visited_ids = set()
+
+        # 1단계: Planning
+        print("   [PageIndex] 1단계(Planning): 목차에서 관련 섹션 탐색 중...")
+        selected_ids, reason, _ = pageindex_planning(query, self.toc_text, client)
+        print(f"   [PageIndex] 선택된 섹션: {selected_ids}")
+        if reason:
+            print(f"   [PageIndex] 선택 이유: {reason}")
+
+        if not selected_ids:
+            print("   [PageIndex] 관련 섹션을 찾지 못함. 루트 노드의 자식들을 사용합니다.")
+            selected_ids = [c.node_id for c in self.root.children[:3]]
+
+        # 2단계: Inspection Loop
+        max_loops = Config.PAGEINDEX_MAX_INSPECT_LOOPS
+        loop_count = 0
+        pending_ids = list(selected_ids)
+
+        while pending_ids and loop_count < max_loops:
+            loop_count += 1
+            current_id = pending_ids.pop(0)
+
+            if current_id in visited_ids:
+                continue
+            visited_ids.add(current_id)
+
+            node = find_node_by_id(self.root, current_id)
+            if not node:
+                print(f"   [PageIndex] 노드 {current_id}을 찾을 수 없음. 건너뜁니다.")
+                continue
+
+            section_content = node.get_full_content()
+            print(f"   [PageIndex] 2단계(Inspection #{loop_count}): [{node.node_id}] {node.title} 분석 중...")
+
+            sufficient, evidence, next_ids, _ = pageindex_inspection(
+                query, section_content, node.title,
+                [f"[{nid}]" for nid in visited_ids],
+                self.toc_text, client
+            )
+
+            collected_sections.append({
+                'node_id': node.node_id,
+                'title': node.title,
+                'content': section_content[:3000],
+                'evidence': evidence,
+            })
+
+            if sufficient:
+                print(f"   [PageIndex] 충분한 정보 확보 완료!")
+                break
+            else:
+                # 아직 확인하지 않은 섹션만 추가
+                new_ids = [nid for nid in next_ids if nid not in visited_ids]
+                if new_ids:
+                    print(f"   [PageIndex] 추가 탐색 필요: {new_ids}")
+                    pending_ids = new_ids + pending_ids
+
+        print(f"   [PageIndex] 총 {len(collected_sections)}개 섹션 수집 완료 (탐색 {loop_count}회)")
+        return collected_sections
+
+    def get_toc(self):
+        """목차 텍스트 반환"""
+        return self.toc_text
+
+    def save_to_cache(self, cache_dir):
+        """PageIndex 데이터를 캐시에 저장"""
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir)
+
+        cache_file = os.path.join(cache_dir, 'pageindex.pkl')
+        data = {
+            'root': self.root.to_dict() if self.root else None,
+            'toc_text': self.toc_text,
+            'is_ready': self.is_ready,
+        }
+        with open(cache_file, 'wb') as f:
+            pickle.dump(data, f)
+        print(f"   [PageIndex Cache] 저장 완료: {cache_file}")
+
+    def load_from_cache(self, cache_dir):
+        """PageIndex 데이터를 캐시에서 로드"""
+        cache_file = os.path.join(cache_dir, 'pageindex.pkl')
+        if not os.path.exists(cache_file):
+            return False
+
+        try:
+            with open(cache_file, 'rb') as f:
+                data = pickle.load(f)
+            if data.get('root'):
+                self.root = DocumentNode.from_dict(data['root'])
+            self.toc_text = data.get('toc_text', '')
+            self.is_ready = data.get('is_ready', False)
+            print(f"   [PageIndex Cache] 로드 완료")
+            return self.is_ready
+        except Exception as e:
+            print(f"   [PageIndex Cache] 로드 실패: {e}")
+            return False
+
+
+# ==========================================
+# 7. 메인 로직
 # ==========================================
 def main():
     print("=== Advanced Multi-Mode RAG Bot ===")
@@ -702,6 +1385,7 @@ def main():
     vector_store = VectorStore()
     keyword_store = KeywordStore()
     summary_cache = SummaryCache()
+    pageindex_store = PageIndexStore()
 
     if index_cache.is_valid():
         # 캐시가 유효하면 로드
@@ -725,6 +1409,10 @@ def main():
                 print(f"[Cache] 사전 요약 로드 완료 ({len(cached_summary)}자)")
             elif Config.PRE_SUMMARIZE:
                 summary_cache.generate(text)
+
+            # PageIndex 캐시 로드 시도
+            if not pageindex_store.load_from_cache(Config.CACHE_DIR):
+                print("[PageIndex] 캐시 없음. 질문 시 자동 빌드됩니다.")
         else:
             print("[Cache] 캐시 로드 실패. 새로 인덱싱합니다...")
             index_cache.clear()
@@ -736,6 +1424,7 @@ def main():
             if Config.PRE_SUMMARIZE:
                 summary_cache.generate(text)
             index_cache.save(chunks, embeddings, summary_cache.get_summary())
+            print("[PageIndex] 캐시 없음. 질문 시 자동 빌드됩니다.")
     else:
         # 캐시가 없거나 무효화됨 → 새로 인덱싱
         print("[Cache] 캐시 없음 또는 무효화됨. 새로 인덱싱합니다...")
@@ -756,6 +1445,7 @@ def main():
 
         # 캐시 저장
         index_cache.save(chunks, embeddings, summary_cache.get_summary())
+        print("[PageIndex] 질문 시 자동 빌드됩니다.")
 
     while True:
         print("\n" + "="*40)
@@ -764,10 +1454,11 @@ def main():
         print(" 3. 키워드 검색 (BM25)")
         print(" 4. 하이브리드 검색 (Hybrid + Rerank)")
         print(" 5. 자동 모드 (Query Router) ★ 추천")
+        print(" 6. PageIndex (계층적 목차 탐색) ★ 규정 문서 특화")
         print(" q. 종료")
         print("="*40)
 
-        mode = input("검색 모드를 선택하세요 (1-5): ").strip()
+        mode = input("검색 모드를 선택하세요 (1-6): ").strip()
         if mode.lower() in ['q', 'exit']: break
         
         original_query = input("\n질문: ").strip()
@@ -888,6 +1579,54 @@ def main():
                 final_docs = rerank_documents(query, combined_docs)
                 context = "\n---\n".join(final_docs)
                 print(f"[Mode 5-SEARCH] 하이브리드 검색, {len(final_docs)}개 청크 사용.")
+
+        elif mode == '6':
+            # === PageIndex 모드 (계층적 목차 탐색 에이전트) ===
+            print("   [PageIndex] 계층적 목차 기반 에이전틱 탐색 모드")
+
+            # PageIndex가 아직 빌드되지 않았으면 빌드
+            if not pageindex_store.is_ready:
+                print("   [PageIndex] 최초 실행: 문서 인덱스를 구축합니다...")
+                pageindex_store.build_index(file_path, full_text=text)
+                # 캐시에 저장
+                pageindex_store.save_to_cache(Config.CACHE_DIR)
+
+            # 목차 표시 (선택적)
+            toc = pageindex_store.get_toc()
+            toc_lines = toc.split('\n')
+            print(f"\n   [PageIndex] 문서 목차 ({len(toc_lines)}개 섹션):")
+            for line in toc_lines[:15]:
+                print(f"     {line}")
+            if len(toc_lines) > 15:
+                print(f"     ... 외 {len(toc_lines) - 15}개 섹션")
+
+            # 에이전틱 탐색 수행
+            print(f"\n   [PageIndex] 에이전틱 추론 탐색 시작...")
+            collected_sections = pageindex_store.search(query)
+
+            if collected_sections:
+                # PageIndex 전용 답변 생성 프롬프트
+                prompt_text = pageindex_generate_answer(query, collected_sections)
+
+                print(f"\n[Mode 6] PageIndex 탐색 완료. {len(collected_sections)}개 섹션 기반 답변 생성 중...\n")
+
+                try:
+                    client = ollama.Client(host=Config.OLLAMA_HOST)
+                    stream = client.chat(
+                        model=Config.MODEL_CHAT,
+                        messages=[{'role': 'user', 'content': prompt_text}],
+                        stream=True,
+                        options=get_llm_options()
+                    )
+                    for chunk_data in stream:
+                        print(chunk_data['message']['content'], end="", flush=True)
+                    print()
+                except Exception as e:
+                    print(f"Ollama 오류: {e}")
+                continue  # Mode 6은 자체 답변 생성을 하므로 아래 공통 답변 생성 건너뜀
+            else:
+                context = text[:5000]
+                print(f"[Mode 6] 관련 섹션을 찾지 못함. 문서 앞부분으로 대체합니다.")
 
         else:
             print("잘못된 입력입니다.")
