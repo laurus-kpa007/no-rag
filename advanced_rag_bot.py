@@ -1975,8 +1975,37 @@ class PageIndexStore:
 # ==========================================
 # 7. 메인 로직
 # ==========================================
+VERSION = "2.0.0"
+CHANGELOG = """
+  v2.0.0 (2026-02-23)
+   - PageIndex 정확도 대폭 개선
+     * 조기 종료 제거: planned 섹션 전부 수집 후 추가 탐색 판단
+     * 복합 질문 분해(Query Decomposition) 추가
+     * 수집 후 Reranking 단계 추가
+     * Planning/Inspection 전용 Temperature 0.2 도입
+     * 섹션 내용 잘림 3000->5000자, TOC 잘림 제거
+   - 비정형 문서 전처리 통합
+     * 규칙 기반 + LLM 보조 섹션 경계 탐지
+     * 섹션 경계 인식형 청킹 (문장 중간 잘림 방지)
+     * 모든 모드에서 논리적 섹션 공유
+  v1.2.0
+   - 헤딩 없는 문서에 LLM 기반 스마트 섹션 분할 추가
+  v1.1.0
+   - 질문 유효성 검증 로직 추가 및 버그 수정
+  v1.0.0
+   - 7가지 검색 모드 (No-RAG, Vector, BM25, Hybrid, Router, PageIndex, 교차검증)
+   - 캐시 시스템, 사전 요약, Query Router
+"""
+
 def main():
-    print("=== Advanced Multi-Mode RAG Bot ===")
+    print(f"""
+{'='*50}
+  Advanced Multi-Mode RAG Bot  v{VERSION}
+{'='*50}
+  Model: {Config.MODEL_CHAT} | Embed: {Config.MODEL_EMBED}
+  Context: {Config.NUM_CTX:,} tokens
+{'='*50}
+{CHANGELOG}""")
     
     # 1. 문서 로드
     if len(sys.argv) > 1:
