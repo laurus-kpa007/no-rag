@@ -4,3 +4,6 @@ __pycache__/
 *.bin
 debug_extracted.txt
 data.docx
+test_data/
+test_output/
+test_output_full/
