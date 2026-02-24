@@ -110,6 +110,17 @@ def _build_sections(
         ]
         content_elements = _collect_elements(own_indices, original_sections, used_sections)
 
+        # 빈 섹션에 description 삽입 (매핑된 원본이 없거나 body가 비어있을 때)
+        if not content_elements and (item.description or item.source_sections):
+            fallback_text = item.description if item.description else f"({item.title} 섹션)"
+            content_elements = [DocumentElement(
+                type='paragraph', content=fallback_text, level=0
+            )]
+
+        # 진단 로그
+        print(f"  [매핑] '{item.title}' ← 인덱스 {own_indices} → {len(content_elements)}개 요소"
+              + (f" (하위: {len(item.subsections)}개)" if item.subsections else ""))
+
         # 내용 다듬기 (선택)
         if refine and content_elements:
             content_elements = _refine_content(item.title, content_elements)

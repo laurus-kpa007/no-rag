@@ -335,6 +335,122 @@ def test_restructure_without_llm(structured_path: str):
     return len(errors) == 0
 
 
+def test_edge_cases(structured_path: str):
+    """
+    엣지 케이스 테스트: LLM이 잘못된 인덱스를 반환하는 상황을 시뮬레이션.
+    - 범위 초과 인덱스
+    - 부모-자식 완전 중복 인덱스
+    - 빈 source_sections
+    - description으로 빈 부모 섹션 보완
+    """
+    from .extractor import extract_document, elements_to_sections
+    from .analyzer import TocItem, RestructurePlan, DocumentAnalysis, _validate_source_sections
+    from .restructurer import restructure_document
+    from .writer_md import write_md
+
+    print("\n" + "=" * 50)
+    print("엣지 케이스 테스트")
+    print("=" * 50)
+
+    extracted = extract_document(structured_path)
+    sections = elements_to_sections(extracted.elements)
+    total = len(sections)
+
+    errors = []
+
+    # --- 테스트 1: 범위 초과 인덱스 검증 ---
+    print("\n[테스트 1] 범위 초과 인덱스 검증")
+    test_items = [
+        TocItem(level=1, title='유효 섹션', source_sections=[0, 1]),
+        TocItem(level=1, title='범위 초과', source_sections=[99, -1, 100]),
+        TocItem(level=1, title='혼합', source_sections=[2, 50, 3]),
+    ]
+    _validate_source_sections(test_items, total)
+
+    if test_items[0].source_sections == [0, 1]:
+        print("  [PASS] 유효 인덱스 보존됨")
+    else:
+        errors.append(f"유효 인덱스가 변경됨: {test_items[0].source_sections}")
+
+    if test_items[1].source_sections == []:
+        print("  [PASS] 범위 초과 인덱스 모두 제거됨")
+    else:
+        errors.append(f"범위 초과 인덱스 제거 실패: {test_items[1].source_sections}")
+
+    if test_items[2].source_sections == [2, 3]:
+        print("  [PASS] 혼합 인덱스에서 초과만 제거됨")
+    else:
+        errors.append(f"혼합 인덱스 처리 실패: {test_items[2].source_sections}")
+
+    # --- 테스트 2: 부모-자식 완전 중복 + description 보완 ---
+    print("\n[테스트 2] 부모-자식 인덱스 중복 + description 보완")
+    analysis = DocumentAnalysis(
+        document_type='보고서', main_topic='테스트',
+        key_themes=[], current_structure_assessment='', content_sections=[],
+    )
+    plan = RestructurePlan(
+        title='엣지 케이스 테스트',
+        toc=[
+            TocItem(level=1, title='부모 섹션', source_sections=[0, 1, 2],
+                    description='이 섹션은 AI 기술 현황을 다룹니다.',
+                    subsections=[
+                        TocItem(level=2, title='자식1', source_sections=[0, 1]),
+                        TocItem(level=2, title='자식2', source_sections=[2]),
+                    ]),
+            TocItem(level=1, title='나머지', source_sections=[3, 4, 5, 6]),
+        ],
+        analysis=analysis,
+    )
+
+    restructured = restructure_document(extracted, plan, refine=False)
+
+    # 부모의 own_indices는 [0,1,2] - [0,1] - [2] = [] → description이 삽입되어야 함
+    parent = restructured.sections[0]
+    if parent.content_elements:
+        if parent.content_elements[0].content == '이 섹션은 AI 기술 현황을 다룹니다.':
+            print("  [PASS] 빈 부모에 description이 삽입됨")
+        else:
+            errors.append(f"description 삽입 내용 불일치: {parent.content_elements[0].content}")
+    else:
+        errors.append("부모 섹션에 description이 삽입되지 않음 (content_elements 비어있음)")
+
+    # 자식 섹션에 내용이 있는지
+    if parent.subsections[0].content_elements:
+        print("  [PASS] 자식1에 내용 존재")
+    else:
+        errors.append("자식1에 내용이 없음")
+
+    if parent.subsections[1].content_elements:
+        print("  [PASS] 자식2에 내용 존재")
+    else:
+        errors.append("자식2에 내용이 없음")
+
+    # --- 테스트 3: 출력에서 모든 계획된 섹션이 나타나는지 ---
+    print("\n[테스트 3] 모든 계획된 섹션이 출력에 반영되는지")
+    output_dir = 'test_output'
+    os.makedirs(output_dir, exist_ok=True)
+    output_md = os.path.join(output_dir, 'test_edge_case.md')
+    write_md(restructured, output_md)
+
+    with open(output_md, 'r', encoding='utf-8') as f:
+        md_content = f.read()
+
+    for title in ['부모 섹션', '자식1', '자식2', '나머지']:
+        if title in md_content:
+            print(f"  [PASS] '{title}' 섹션이 출력에 존재")
+        else:
+            errors.append(f"'{title}' 섹션이 출력에서 누락됨")
+
+    if errors:
+        print(f"\n[FAIL] {len(errors)}개 오류 발견:")
+        for err in errors:
+            print(f"  - {err}")
+    else:
+        print("\n[ALL PASS] 모든 엣지 케이스 테스트 통과!")
+
+    return len(errors) == 0
+
+
 def main():
     """테스트 메인"""
     print("=" * 55)
@@ -347,7 +463,10 @@ def main():
     # Step 2: 재구성 로직 테스트 (Ollama 불필요)
     passed = test_restructure_without_llm(structured_path)
 
-    # Step 3: 전체 파이프라인 테스트 (Ollama 필요)
+    # Step 3: 엣지 케이스 테스트 (Ollama 불필요)
+    passed = test_edge_cases(structured_path) and passed
+
+    # Step 4: 전체 파이프라인 테스트 (Ollama 필요)
     if '--full' in sys.argv:
         print("\n" + "=" * 55)
         print("전체 파이프라인 테스트 (Ollama 필요)")
