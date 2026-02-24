@@ -16,6 +16,7 @@ import os
 import sys
 import argparse
 import time
+from datetime import datetime
 
 from .config import Config
 from .parser import parse_document
@@ -87,11 +88,12 @@ def main():
 
     start_time = time.time()
 
-    # 출력 파일 경로 결정
+    # 출력 파일 경로 결정 (타임스탬프로 중복 방지)
     base_name = os.path.splitext(os.path.basename(input_file))[0]
     output_dir = args.output_dir
-    output_docx = os.path.join(output_dir, f"{base_name}_restructured.docx")
-    output_md = os.path.join(output_dir, f"{base_name}_restructured.md")
+    timestamp = datetime.now().strftime("%m%d%H%M")
+    output_docx = os.path.join(output_dir, f"{base_name}_restructured_{timestamp}.docx")
+    output_md = os.path.join(output_dir, f"{base_name}_restructured_{timestamp}.md")
 
     print(f"[시작] 입력: {input_file} ({ext})")
     print(f"[시작] 출력: {output_docx}, {output_md}")
