@@ -1,10 +1,12 @@
 import os
+from urllib.parse import urlparse
+
 import ollama
 
 
 class Config:
-    # Ollama 서버 설정
-    OLLAMA_HOST = 'http://localhost:11434'
+    # Ollama 서버 설정 (환경변수 OLLAMA_HOST로 오버라이드 가능)
+    OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://70.30.171.45:11434')
 
     # 모델 설정
     MODEL = 'gemma3:27b'
@@ -25,7 +27,17 @@ class Config:
 
 
 def get_ollama_client():
-    """OLLAMA_HOST 설정을 사용하는 클라이언트 반환"""
+    """OLLAMA_HOST 설정을 사용하는 클라이언트 반환 (프록시 자동 우회)"""
+    # OLLAMA_HOST에서 호스트명 추출하여 NO_PROXY에 추가
+    parsed = urlparse(Config.OLLAMA_HOST)
+    target_host = parsed.hostname or 'localhost'
+
+    no_proxy = os.environ.get('NO_PROXY', os.environ.get('no_proxy', ''))
+    if target_host not in no_proxy:
+        entries = [e.strip() for e in no_proxy.split(',') if e.strip()]
+        entries.append(target_host)
+        os.environ['NO_PROXY'] = ','.join(entries)
+
     return ollama.Client(host=Config.OLLAMA_HOST)
 
 

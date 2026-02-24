@@ -122,8 +122,10 @@ def main():
         print(f"  → 콘텐츠 섹션: {len(analysis.content_sections)}개")
     except Exception as e:
         print(f"[오류] 문서 분석 실패: {e}")
-        print("[INFO] Ollama가 실행 중인지, gemma3:27b 모델이 설치되어 있는지 확인하세요.")
-        print("[INFO]   ollama pull gemma3:27b")
+        print(f"[INFO] Ollama 서버({Config.OLLAMA_HOST})가 실행 중인지 확인하세요.")
+        print(f"[INFO]   ollama pull {Config.MODEL}")
+        if 'proxy' in str(e).lower() or 'connect' in str(e).lower():
+            print("[INFO] 프록시 문제가 의심됩니다. NO_PROXY 환경변수에 Ollama 호스트를 추가하세요.")
         sys.exit(1)
 
     # Step 3: 재구성 계획 생성 (Pass 2)
