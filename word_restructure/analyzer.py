@@ -157,15 +157,42 @@ def generate_restructure_plan(
         'assessment': analysis.current_structure_assessment,
     }, ensure_ascii=False, indent=2)
 
-    prompt = f"""당신은 전문 문서 구조화 전문가입니다.
+    # 문서 규모 기반 동적 가이드 계산
+    n = len(sections)
+    if n <= 5:
+        min_major = 2
+        depth_guide = "1~2 레벨 구조로 구성하세요."
+        detail_guide = ""
+    elif n <= 15:
+        min_major = max(3, n // 4)
+        depth_guide = "반드시 2레벨(대분류/중분류) 이상으로 구성하세요."
+        detail_guide = (
+            f"- 대분류(level 1)는 최소 {min_major}개 이상 만드세요\n"
+            f"- 원본 섹션이 3개 이상 배정된 대분류는 반드시 중분류(subsections)로 세분화하세요"
+        )
+    else:
+        min_major = max(5, n // 5)
+        depth_guide = "반드시 3레벨(대분류/중분류/소분류) 구조로 상세하게 구성하세요."
+        detail_guide = (
+            f"- 대분류(level 1)는 최소 {min_major}개 이상 만드세요\n"
+            f"- 모든 대분류는 반드시 2개 이상의 중분류(level 2 subsections)를 포함하세요\n"
+            f"- 원본 섹션이 3개 이상 배정된 중분류는 소분류(level 3)로 추가 세분화하세요"
+        )
+
+    print(f"  [가이드] 원본 {n}개 섹션 → 최소 대분류 {min_major}개, {depth_guide}")
+
+    prompt = f"""당신은 전문 문서 구조화 전문가입니다. 문서를 체계적이고 상세한 트리 구조 목차로 재구성합니다.
+이 목차는 RAG(Retrieval-Augmented Generation) 시스템의 PageIndex 전처리에 사용됩니다.
+따라서 **정확하고 균형 잡힌 트리 구조**가 매우 중요합니다.
 
 [문서 분석 결과]
 {analysis_summary}
 
-[원본 섹션 목록] (인덱스: 0 ~ {len(sections)-1}, 총 {len(sections)}개)
+[원본 섹션 목록] (인덱스: 0 ~ {n-1}, 총 {n}개)
 {sections_text}
 
-위 문서를 가장 적합한 구조로 재구성하는 목차를 설계하세요.
+위 문서를 가장 적합한 구조로 재구성하는 **상세한 목차**를 설계하세요.
+{depth_guide}
 
 JSON 형식으로 출력하세요. 반드시 유효한 JSON만 출력하세요:
 {{
@@ -173,21 +200,87 @@ JSON 형식으로 출력하세요. 반드시 유효한 JSON만 출력하세요:
   "toc": [
     {{
       "level": 1,
-      "title": "1. 섹션 제목",
-      "description": "이 섹션에 들어갈 내용 설명 (1-2문장)",
-      "source_sections": [0, 1, 2],
+      "title": "1. 개요",
+      "description": "문서의 배경과 목적을 소개",
+      "source_sections": [0, 1],
       "subsections": [
         {{
           "level": 2,
-          "title": "1.1 하위 섹션 제목",
-          "description": "하위 섹션 내용 설명",
+          "title": "1.1 배경",
+          "description": "프로젝트 배경 설명",
           "source_sections": [0]
         }},
         {{
           "level": 2,
-          "title": "1.2 다른 하위 섹션",
-          "description": "다른 하위 섹션 설명",
+          "title": "1.2 목적 및 범위",
+          "description": "문서의 목적과 범위 정의",
           "source_sections": [1]
+        }}
+      ]
+    }},
+    {{
+      "level": 1,
+      "title": "2. 현황 분석",
+      "description": "현재 상황에 대한 분석 결과",
+      "source_sections": [2, 3, 4, 5],
+      "subsections": [
+        {{
+          "level": 2,
+          "title": "2.1 데이터 분석",
+          "description": "수집된 데이터의 분석 결과",
+          "source_sections": [2, 3]
+        }},
+        {{
+          "level": 2,
+          "title": "2.2 문제점 도출",
+          "description": "분석을 통해 도출된 주요 문제점",
+          "source_sections": [4]
+        }},
+        {{
+          "level": 2,
+          "title": "2.3 시사점",
+          "description": "분석 결과의 시사점 정리",
+          "source_sections": [5]
+        }}
+      ]
+    }},
+    {{
+      "level": 1,
+      "title": "3. 세부 내용",
+      "description": "핵심 내용 상세 기술",
+      "source_sections": [6, 7, 8],
+      "subsections": [
+        {{
+          "level": 2,
+          "title": "3.1 주요 항목",
+          "description": "핵심 항목에 대한 상세 설명",
+          "source_sections": [6, 7]
+        }},
+        {{
+          "level": 2,
+          "title": "3.2 부가 항목",
+          "description": "보조적인 항목 설명",
+          "source_sections": [8]
+        }}
+      ]
+    }},
+    {{
+      "level": 1,
+      "title": "4. 결론 및 제언",
+      "description": "결론 요약과 향후 제언",
+      "source_sections": [9, 10],
+      "subsections": [
+        {{
+          "level": 2,
+          "title": "4.1 결론",
+          "description": "핵심 결론 요약",
+          "source_sections": [9]
+        }},
+        {{
+          "level": 2,
+          "title": "4.2 향후 제언",
+          "description": "향후 방향에 대한 제언",
+          "source_sections": [10]
         }}
       ]
     }}
@@ -195,26 +288,40 @@ JSON 형식으로 출력하세요. 반드시 유효한 JSON만 출력하세요:
 }}
 
 중요 규칙:
-1. source_sections는 반드시 0 ~ {len(sections)-1} 범위의 정수만 사용하세요 (총 {len(sections)}개 섹션)
-2. 모든 원본 섹션(0~{len(sections)-1})이 반드시 하나 이상의 source_sections에 포함되어야 합니다 (내용 누락 방지)
+1. source_sections는 반드시 0 ~ {n-1} 범위의 정수만 사용하세요 (총 {n}개 섹션)
+2. 모든 원본 섹션(0~{n-1})이 반드시 하나 이상의 source_sections에 포함되어야 합니다 (내용 누락 방지)
 3. 하위 섹션(subsections)의 source_sections는 상위 섹션의 source_sections 부분집합이어야 합니다
    - 예: 상위 source_sections=[0,1,2] → 하위1=[0], 하위2=[1,2] (상위 본문에는 나머지만 배치됨)
 4. source_sections가 비어있으면([]) 해당 섹션에 원본 내용이 배치되지 않으므로, 반드시 하나 이상의 인덱스를 넣으세요
 5. description은 반드시 작성하세요 (빈 문자열 금지)
 
+목차 세분화 규칙 (매우 중요!):
+{detail_guide if detail_guide else "- 문서 내용에 맞게 적절히 세분화하세요"}
+- 대분류를 2~3개만 만들고 끝내지 마세요. 내용이 많은 문서는 충분히 세분화해야 합니다
+- 하나의 대분류에 원본 섹션을 과도하게 몰아넣지 마세요. 논리적으로 분산시키세요
+- 내용이 많은 대분류(source_sections 3개 이상)는 반드시 중분류(subsections)로 나누세요
+- level 1(대분류)은 최소 {min_major}개 이상 생성하세요
+
+RAG 트리 품질 규칙 (이 목차는 검색 인덱스로 사용됩니다):
+- 각 리프 노드(최하위 섹션)는 명확하고 구체적인 주제를 가져야 합니다
+- 트리가 한쪽으로 치우치지 않게 균형 잡힌 구조를 만드세요 (한 대분류에 8개 중분류, 다른 대분류에 1개 중분류 등은 지양)
+- 각 섹션의 title은 해당 내용을 검색할 때 키워드로 활용되므로, 구체적이고 명확하게 작성하세요
+- 너무 포괄적인 제목(예: "기타", "추가 내용") 대신 내용을 반영하는 제목을 사용하세요
+- description은 해당 섹션의 핵심 내용을 요약하는 1-2문장으로 작성하세요 (검색 컨텍스트로 활용됨)
+
 구조 규칙:
 - 문서 유형({analysis.document_type})에 적합한 표준 구조를 따르세요
-- level은 1부터 시작 (1=최상위, 2=하위, 3=하하위), 최대 3레벨
-- 문서 유형별 표준 구조:
-  - 보고서: 요약 → 서론 → 본론 (분석/결과) → 결론 → 부록
-  - 매뉴얼: 개요 → 설치/설정 → 사용법 → FAQ → 부록
-  - 제안서: 요약 → 배경 → 제안 내용 → 기대효과 → 일정/예산
-  - 기술문서: 개요 → 아키텍처 → 상세 설명 → API/참조 → 부록
-  - 기타: 서론 → 본론 → 결론
+- level은 1부터 시작 (1=대분류, 2=중분류, 3=소분류), 최대 3레벨
+- 문서 유형별 표준 구조 (중분류까지 예시):
+  - 보고서: 1.요약(1.1 배경, 1.2 핵심결과) → 2.서론(2.1 목적, 2.2 범위) → 3.본론(3.1 분석, 3.2 결과, 3.3 논의) → 4.결론(4.1 요약, 4.2 제언) → 5.부록
+  - 매뉴얼: 1.개요(1.1 소개, 1.2 구성) → 2.설치(2.1 요구사항, 2.2 절차) → 3.사용법(3.1 기본, 3.2 고급) → 4.FAQ → 5.부록
+  - 제안서: 1.요약 → 2.배경(2.1 현황, 2.2 문제점) → 3.제안(3.1 개요, 3.2 세부방안) → 4.기대효과(4.1 정량, 4.2 정성) → 5.일정/예산
+  - 기술문서: 1.개요(1.1 목적, 1.2 범위) → 2.아키텍처(2.1 구조, 2.2 흐름) → 3.상세설명(3.1~3.N 각 모듈) → 4.API/참조 → 5.부록
+  - 기타: 1.서론(1.1 배경, 1.2 목적) → 2~N.본론(각각 중분류 포함) → N+1.결론
 - 문서의 언어에 맞춰 응답하세요"""
 
     try:
-        result = _call_llm_json(prompt)
+        result = _call_llm_json(prompt, temperature=Config.TEMPERATURE_STRUCTURE)
         toc_items = _parse_toc_items(result.get('toc', []))
 
         total_sections = len(sections)
