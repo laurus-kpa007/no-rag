@@ -162,7 +162,7 @@ def generate_restructure_plan(
 [문서 분석 결과]
 {analysis_summary}
 
-[원본 섹션 목록]
+[원본 섹션 목록] (인덱스: 0 ~ {len(sections)-1}, 총 {len(sections)}개)
 {sections_text}
 
 위 문서를 가장 적합한 구조로 재구성하는 목차를 설계하세요.
@@ -173,27 +173,38 @@ JSON 형식으로 출력하세요. 반드시 유효한 JSON만 출력하세요:
   "toc": [
     {{
       "level": 1,
-      "title": "1장 섹션 제목",
-      "description": "이 섹션에 들어갈 내용 설명",
-      "source_sections": [0, 1],
+      "title": "1. 섹션 제목",
+      "description": "이 섹션에 들어갈 내용 설명 (1-2문장)",
+      "source_sections": [0, 1, 2],
       "subsections": [
         {{
           "level": 2,
           "title": "1.1 하위 섹션 제목",
           "description": "하위 섹션 내용 설명",
           "source_sections": [0]
+        }},
+        {{
+          "level": 2,
+          "title": "1.2 다른 하위 섹션",
+          "description": "다른 하위 섹션 설명",
+          "source_sections": [1]
         }}
       ]
     }}
   ]
 }}
 
-규칙:
+중요 규칙:
+1. source_sections는 반드시 0 ~ {len(sections)-1} 범위의 정수만 사용하세요 (총 {len(sections)}개 섹션)
+2. 모든 원본 섹션(0~{len(sections)-1})이 반드시 하나 이상의 source_sections에 포함되어야 합니다 (내용 누락 방지)
+3. 하위 섹션(subsections)의 source_sections는 상위 섹션의 source_sections 부분집합이어야 합니다
+   - 예: 상위 source_sections=[0,1,2] → 하위1=[0], 하위2=[1,2] (상위 본문에는 나머지만 배치됨)
+4. source_sections가 비어있으면([]) 해당 섹션에 원본 내용이 배치되지 않으므로, 반드시 하나 이상의 인덱스를 넣으세요
+5. description은 반드시 작성하세요 (빈 문자열 금지)
+
+구조 규칙:
 - 문서 유형({analysis.document_type})에 적합한 표준 구조를 따르세요
-- 모든 원본 섹션이 최소 하나의 새 섹션에 매핑되어야 합니다 (내용 누락 방지)
-- source_sections의 숫자는 [원본 섹션 목록]의 인덱스 번호입니다
-- level은 1부터 시작 (1=최상위, 2=하위, 3=하하위)
-- 목차는 최대 3레벨까지
+- level은 1부터 시작 (1=최상위, 2=하위, 3=하하위), 최대 3레벨
 - 문서 유형별 표준 구조:
   - 보고서: 요약 → 서론 → 본론 (분석/결과) → 결론 → 부록
   - 매뉴얼: 개요 → 설치/설정 → 사용법 → FAQ → 부록
@@ -206,14 +217,18 @@ JSON 형식으로 출력하세요. 반드시 유효한 JSON만 출력하세요:
         result = _call_llm_json(prompt)
         toc_items = _parse_toc_items(result.get('toc', []))
 
+        total_sections = len(sections)
+
+        # 인덱스 유효성 검증 (범위 초과 제거, 경고 출력)
+        _validate_source_sections(toc_items, total_sections)
+
         # 누락된 원본 섹션 확인 및 보정
         all_mapped = set()
         _collect_mapped_sections(toc_items, all_mapped)
-        total_sections = len(sections)
         unmapped = [i for i in range(total_sections) if i not in all_mapped]
 
-        if unmapped and toc_items:
-            # 누락된 섹션을 마지막 항목의 "기타" 하위 섹션으로 추가
+        if unmapped:
+            print(f"  [보정] 매핑되지 않은 원본 섹션 {unmapped}을 '기타'에 추가")
             toc_items.append(TocItem(
                 level=1,
                 title='기타',
@@ -244,6 +259,20 @@ def _parse_toc_items(toc_data: list) -> List[TocItem]:
             description=item_data.get('description', ''),
         ))
     return items
+
+
+def _validate_source_sections(toc_items: List[TocItem], total_sections: int):
+    """source_sections의 유효성 검증 및 보정"""
+    for item in toc_items:
+        # 범위 초과 인덱스 제거
+        valid = [i for i in item.source_sections if isinstance(i, int) and 0 <= i < total_sections]
+        invalid = [i for i in item.source_sections if i not in valid]
+        if invalid:
+            print(f"  [경고] '{item.title}' 범위 초과 인덱스 제거: {invalid} (유효: 0~{total_sections-1})")
+        item.source_sections = valid
+
+        # 하위 섹션도 재귀 검증
+        _validate_source_sections(item.subsections, total_sections)
 
 
 def _collect_mapped_sections(toc_items: List[TocItem], mapped: set):
