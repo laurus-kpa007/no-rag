@@ -58,11 +58,14 @@ def write_md(restructured: RestructuredDocument, output_path: str):
 
 
 def _generate_toc(sections: List[RestructuredSection]) -> List[str]:
-    """목차 생성"""
+    """목차 생성 (빈 섹션 제외)"""
     lines = []
 
     def _add_toc_entries(sects: List[RestructuredSection], indent: int = 0):
         for section in sects:
+            # 내용도 하위 섹션도 없는 빈 섹션은 목차에서도 제외
+            if not section.content_elements and not section.subsections:
+                continue
             prefix = '  ' * indent
             anchor = _title_to_anchor(section.title)
             lines.append(f"{prefix}- [{section.title}](#{anchor})")

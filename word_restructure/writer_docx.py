@@ -47,7 +47,7 @@ def write_docx(restructured: RestructuredDocument, output_path: str):
     doc.add_paragraph('─' * 50)
 
     # 목차 삽입
-    _add_toc(doc)
+    _add_toc(doc, restructured.sections)
 
     # 페이지 나누기
     doc.add_page_break()
@@ -94,9 +94,14 @@ def _setup_styles(doc: Document):
             hs.font.color.rgb = colors.get(i, RGBColor(0, 0, 0))
 
 
-def _add_toc(doc: Document):
-    """Word 자동 목차(TOC) 필드 삽입"""
-    toc_heading = doc.add_heading('목차', level=1)
+def _add_toc(doc: Document, sections=None):
+    """Word 자동 목차(TOC) 필드 삽입 + 수동 목차 미리보기"""
+    doc.add_heading('목차', level=1)
+
+    # 수동 목차 미리보기 (자동 TOC가 업데이트 안 될 때도 볼 수 있도록)
+    if sections:
+        _add_manual_toc_preview(doc, sections)
+        doc.add_paragraph()
 
     # TOC 필드 코드 삽입 (Word에서 열 때 Ctrl+A → F9로 업데이트)
     paragraph = doc.add_paragraph()
@@ -112,13 +117,44 @@ def _add_toc(doc: Document):
     fldChar_separate = parse_xml(f'<w:fldChar {nsdecls("w")} w:fldCharType="separate"/>')
     run3._element.append(fldChar_separate)
 
-    run4 = paragraph.add_run('[목차를 업데이트하려면 이 필드를 선택 후 F9를 누르세요]')
+    run4 = paragraph.add_run('[Word에서 Ctrl+A → F9로 자동 목차를 업데이트하세요]')
     run4.font.color.rgb = RGBColor(128, 128, 128)
     run4.font.size = Pt(9)
 
     run5 = paragraph.add_run()
     fldChar_end = parse_xml(f'<w:fldChar {nsdecls("w")} w:fldCharType="end"/>')
     run5._element.append(fldChar_end)
+
+
+def _add_manual_toc_preview(doc: Document, sections, indent_level=0):
+    """수동 목차 미리보기 작성 (빈 섹션 제외)"""
+    for section in sections:
+        if not section.content_elements and not section.subsections:
+            continue
+        indent = '    ' * indent_level
+        numbering = _get_section_numbering(section, sections, indent_level)
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(1)
+        p.paragraph_format.space_after = Pt(1)
+        p.paragraph_format.left_indent = Cm(indent_level * 1.0)
+        run = p.add_run(f"{numbering}{section.title}")
+        run.font.size = Pt(10)
+        if indent_level == 0:
+            run.bold = True
+        if section.subsections:
+            _add_manual_toc_preview(doc, section.subsections, indent_level + 1)
+
+
+def _get_section_numbering(section, siblings, indent_level):
+    """섹션 번호 생성 (빈 섹션 건너뛰기)"""
+    visible_index = 0
+    for s in siblings:
+        if not s.content_elements and not s.subsections:
+            continue
+        visible_index += 1
+        if s is section:
+            break
+    return f"{visible_index}. " if indent_level == 0 else f"{visible_index}) "
 
 
 def _write_section(doc: Document, section: RestructuredSection):

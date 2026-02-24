@@ -4,7 +4,7 @@ RestructurePlan에 따라 원본 요소들을 새로운 구조로 재배치합�
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Set
 
 from .config import Config, get_ollama_client, get_llm_options
 from .extractor import DocumentElement, ExtractedDocument, elements_to_sections
@@ -50,8 +50,33 @@ def restructure_document(
     # 원본 섹션 매핑
     original_sections = elements_to_sections(extracted.elements)
 
+    # 사용된 원본 섹션 추적 (중복 배치 방지)
+    used_sections: Set[int] = set()
+
     # TOC 항목을 기반으로 재구성된 섹션 생성
-    restructured_sections = _build_sections(plan.toc, original_sections, refine)
+    restructured_sections = _build_sections(
+        plan.toc, original_sections, refine, used_sections
+    )
+
+    # 어디에도 배치되지 않은 원본 섹션 확인
+    total_sections = len(original_sections)
+    unused = [i for i in range(total_sections) if i not in used_sections]
+    if unused:
+        unused_elements = []
+        for idx in unused:
+            section = original_sections[idx]
+            # 서두(level=0)이고 body가 비어있으면 건너뜀
+            if section['level'] == 0 and not section['body_elements']:
+                continue
+            unused_elements.extend(section['body_elements'])
+
+        if unused_elements:
+            print(f"  [경고] {len(unused)}개 원본 섹션이 목차에 매핑되지 않아 '기타' 섹션에 추가")
+            restructured_sections.append(RestructuredSection(
+                level=1,
+                title='기타',
+                content_elements=unused_elements,
+            ))
 
     print(f"[재구성] 완료: {_count_sections(restructured_sections)}개 섹션 생성")
 
@@ -67,20 +92,30 @@ def _build_sections(
     toc_items: List[TocItem],
     original_sections: list,
     refine: bool,
+    used_sections: Set[int],
 ) -> List[RestructuredSection]:
     """TOC 항목을 재구성된 섹션으로 변환"""
     sections = []
 
     for item in toc_items:
-        # 이 섹션에 매핑된 원본 요소 수집
-        content_elements = _collect_elements(item.source_sections, original_sections)
+        # 하위 섹션에서 사용할 인덱스를 미리 수집
+        sub_source_indices = set()
+        _collect_all_source_indices(item.subsections, sub_source_indices)
+
+        # 이 섹션 자체에 매핑된 원본 요소 수집
+        # (하위 섹션에서도 참조하는 인덱스는 하위에서 처리하므로 제외)
+        own_indices = [
+            idx for idx in item.source_sections
+            if idx not in sub_source_indices
+        ]
+        content_elements = _collect_elements(own_indices, original_sections, used_sections)
 
         # 내용 다듬기 (선택)
         if refine and content_elements:
             content_elements = _refine_content(item.title, content_elements)
 
         # 하위 섹션 재귀 처리
-        subsections = _build_sections(item.subsections, original_sections, refine)
+        subsections = _build_sections(item.subsections, original_sections, refine, used_sections)
 
         sections.append(RestructuredSection(
             level=item.level,
@@ -92,19 +127,28 @@ def _build_sections(
     return sections
 
 
+def _collect_all_source_indices(toc_items: List[TocItem], indices: set):
+    """TOC 항목 트리에서 모든 source_sections 인덱스를 수집"""
+    for item in toc_items:
+        indices.update(item.source_sections)
+        _collect_all_source_indices(item.subsections, indices)
+
+
 def _collect_elements(
     source_indices: List[int],
     original_sections: list,
+    used_sections: Set[int],
 ) -> List[DocumentElement]:
-    """원본 섹션 인덱스에서 요소들을 수집"""
+    """원본 섹션 인덱스에서 본문 요소들을 수집 (중복 방지)"""
     elements = []
     for idx in source_indices:
+        if idx in used_sections:
+            continue  # 이미 다른 섹션에서 사용됨
         if 0 <= idx < len(original_sections):
             section = original_sections[idx]
-            for elem in section['elements']:
-                # heading은 새 구조에서 재생성되므로 내용만 가져옴
-                if elem.type != 'heading':
-                    elements.append(elem)
+            # body_elements 사용 (heading 제외된 본문만)
+            elements.extend(section['body_elements'])
+            used_sections.add(idx)
     return elements
 
 

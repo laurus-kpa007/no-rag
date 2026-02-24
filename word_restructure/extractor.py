@@ -215,34 +215,47 @@ def elements_to_sections(elements: List[DocumentElement]) -> List[dict]:
     heading을 기준으로 섹션을 구분합니다.
 
     Returns:
-        list of {'title': str, 'level': int, 'elements': List[DocumentElement], 'index': int}
+        list of {'title': str, 'level': int, 'elements': List[DocumentElement],
+                 'body_elements': List[DocumentElement], 'index': int}
+        - elements: heading 포함 전체 요소
+        - body_elements: heading 제외한 본문 요소만
     """
     sections = []
     current_section = {
         'title': '서두',
         'level': 0,
         'elements': [],
+        'body_elements': [],
         'index': 0,
     }
 
     for elem in elements:
         if elem.type == 'heading' and elem.level > 0:
-            # 이전 섹션 저장 (비어있지 않으면)
-            if current_section['elements']:
-                sections.append(current_section)
+            # 이전 섹션 저장 (heading만 있어도 저장 - 빈 섹션 누락 방지)
+            sections.append(current_section)
 
             current_section = {
                 'title': elem.content,
                 'level': elem.level,
                 'elements': [elem],
+                'body_elements': [],
                 'index': len(sections),
             }
         else:
             current_section['elements'].append(elem)
+            # L0 heading(문서 제목)은 body에 포함하지 않음 (doc_title로 별도 처리됨)
+            if not (elem.type == 'heading' and elem.level == 0):
+                current_section['body_elements'].append(elem)
 
     # 마지막 섹션 저장
-    if current_section['elements']:
-        sections.append(current_section)
+    sections.append(current_section)
+
+    # 서두 섹션이 완전히 비어있으면 제거
+    if sections and sections[0]['title'] == '서두' and not sections[0]['body_elements']:
+        sections.pop(0)
+        # 인덱스 재정렬
+        for i, s in enumerate(sections):
+            s['index'] = i
 
     return sections
 
