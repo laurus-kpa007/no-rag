@@ -14,6 +14,7 @@ class Config:
     # LLM 하이퍼파라미터
     NUM_CTX = 32768
     TEMPERATURE = 0.3          # 구조 분석용 낮은 temperature
+    TEMPERATURE_STRUCTURE = 0.4  # Pass 2 구조화용 (다양한 계층 생성 유도)
     TEMPERATURE_REFINE = 0.5   # 내용 다듬기용
     TOP_P = 0.9
     TOP_K = 40

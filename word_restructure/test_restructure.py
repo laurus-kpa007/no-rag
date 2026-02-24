@@ -451,6 +451,190 @@ def test_edge_cases(structured_path: str):
     return len(errors) == 0
 
 
+def test_dynamic_guide_and_hierarchy():
+    """
+    동적 가이드 계산 로직 테스트 + 다수 섹션 시 계층 깊이 검증.
+    문서 규모에 따라 적절한 min_major/depth_guide가 생성되는지,
+    많은 섹션을 가진 문서에서 중분류가 실제로 생성되는지 검증합니다.
+    """
+    from .extractor import DocumentElement, ExtractedDocument, elements_to_sections
+    from .analyzer import TocItem, RestructurePlan, DocumentAnalysis
+    from .restructurer import restructure_document
+    from .writer_md import write_md
+
+    print("\n" + "=" * 50)
+    print("동적 가이드 + 계층 깊이 테스트")
+    print("=" * 50)
+
+    errors = []
+
+    # --- 테스트 1: 동적 가이드 계산 로직 검증 ---
+    print("\n[테스트 1] 동적 가이드 계산 로직")
+
+    test_cases = [
+        (3, 2, "1~2 레벨"),          # 작은 문서
+        (5, 2, "1~2 레벨"),          # 경계: 5개
+        (6, 3, "2레벨"),             # 중간 문서 시작
+        (12, 3, "2레벨"),            # 중간 문서 (12//4=3)
+        (15, 3, "2레벨"),            # 경계: 15개
+        (16, 5, "3레벨"),            # 큰 문서 시작
+        (30, 6, "3레벨"),            # 큰 문서 (30//5=6)
+        (50, 10, "3레벨"),           # 매우 큰 문서 (50//5=10)
+    ]
+
+    for n, expected_min, expected_keyword in test_cases:
+        if n <= 5:
+            min_major = 2
+            depth_guide = "1~2 레벨 구조로 구성하세요."
+        elif n <= 15:
+            min_major = max(3, n // 4)
+            depth_guide = "반드시 2레벨(대분류/중분류) 이상으로 구성하세요."
+        else:
+            min_major = max(5, n // 5)
+            depth_guide = "반드시 3레벨(대분류/중분류/소분류) 구조로 상세하게 구성하세요."
+
+        if min_major != expected_min:
+            errors.append(f"n={n}: min_major={min_major} (기대: {expected_min})")
+        elif expected_keyword not in depth_guide:
+            errors.append(f"n={n}: depth_guide에 '{expected_keyword}' 없음: {depth_guide}")
+        else:
+            print(f"  [PASS] n={n} → min_major={min_major}, depth_guide에 '{expected_keyword}' 포함")
+
+    # --- 테스트 2: 많은 섹션으로 계층 깊이 검증 ---
+    print("\n[테스트 2] 다수 섹션(12개) 문서에서 대/중분류 계층 검증")
+
+    # 12개 섹션이 있는 Mock 문서 생성
+    elements = [DocumentElement(type='heading', content='테스트 문서', level=0)]
+    section_titles = [
+        '프로젝트 개요', '배경 및 필요성', '목표 설정',
+        '현황 분석', '데이터 수집', '데이터 분석 결과',
+        '설계 방안', '구현 세부사항', '시스템 아키텍처',
+        '테스트 결과', '성능 평가', '결론 및 제언',
+    ]
+    for title in section_titles:
+        elements.append(DocumentElement(type='heading', content=title, level=1))
+        elements.append(DocumentElement(
+            type='paragraph', content=f'{title}에 대한 상세 내용입니다.', level=0
+        ))
+        elements.append(DocumentElement(
+            type='paragraph', content=f'{title} 관련 추가 설명과 데이터를 포함합니다.', level=0
+        ))
+
+    sections = elements_to_sections(elements)
+    print(f"  생성된 섹션 수: {len(sections)}")
+
+    # 12개 섹션 → min_major=3, 2레벨 필수
+    # 대분류 4개 + 각 대분류에 중분류 2~3개로 구성된 계획 만들기
+    analysis = DocumentAnalysis(
+        document_type='기술문서', main_topic='프로젝트 보고서',
+        key_themes=['분석', '설계', '평가'],
+        current_structure_assessment='세분화 필요', content_sections=[],
+    )
+
+    plan = RestructurePlan(
+        title='프로젝트 보고서 (재구성)',
+        toc=[
+            TocItem(level=1, title='1. 개요', source_sections=[0, 1, 2],
+                    description='프로젝트의 배경과 목표',
+                    subsections=[
+                        TocItem(level=2, title='1.1 프로젝트 개요', source_sections=[0],
+                                description='프로젝트 개요 설명'),
+                        TocItem(level=2, title='1.2 배경 및 필요성', source_sections=[1],
+                                description='프로젝트 배경'),
+                        TocItem(level=2, title='1.3 목표', source_sections=[2],
+                                description='목표 설정'),
+                    ]),
+            TocItem(level=1, title='2. 현황 분석', source_sections=[3, 4, 5],
+                    description='현황과 데이터 분석',
+                    subsections=[
+                        TocItem(level=2, title='2.1 현황 분석', source_sections=[3],
+                                description='현황 분석 내용'),
+                        TocItem(level=2, title='2.2 데이터 수집 및 분석', source_sections=[4, 5],
+                                description='데이터 수집과 분석 결과'),
+                    ]),
+            TocItem(level=1, title='3. 설계 및 구현', source_sections=[6, 7, 8],
+                    description='시스템 설계와 구현',
+                    subsections=[
+                        TocItem(level=2, title='3.1 설계 방안', source_sections=[6],
+                                description='설계 방안 상세'),
+                        TocItem(level=2, title='3.2 구현 및 아키텍처', source_sections=[7, 8],
+                                description='구현 세부사항과 아키텍처'),
+                    ]),
+            TocItem(level=1, title='4. 평가 및 결론', source_sections=[9, 10, 11],
+                    description='테스트 결과와 결론',
+                    subsections=[
+                        TocItem(level=2, title='4.1 테스트 및 성능', source_sections=[9, 10],
+                                description='테스트 결과와 성능 평가'),
+                        TocItem(level=2, title='4.2 결론 및 제언', source_sections=[11],
+                                description='결론과 향후 제언'),
+                    ]),
+        ],
+        analysis=analysis,
+    )
+
+    # 가이드 기준에 맞는지 확인
+    n = len(sections)
+    min_major = max(3, n // 4)
+    level1_count = len(plan.toc)
+    total_level2 = sum(len(item.subsections) for item in plan.toc)
+
+    if level1_count < min_major:
+        errors.append(f"대분류 {level1_count}개 < 최소 {min_major}개")
+    else:
+        print(f"  [PASS] 대분류 {level1_count}개 >= 최소 {min_major}개")
+
+    if total_level2 == 0:
+        errors.append("중분류가 하나도 없음")
+    else:
+        print(f"  [PASS] 중분류 총 {total_level2}개 존재")
+
+    # 모든 대분류에 중분류가 있는지
+    for item in plan.toc:
+        if len(item.subsections) == 0:
+            errors.append(f"대분류 '{item.title}'에 중분류 없음")
+        else:
+            print(f"  [PASS] '{item.title}' → 중분류 {len(item.subsections)}개")
+
+    # 재구성 실행 및 출력 검증
+    mock_extracted = ExtractedDocument(
+        elements=elements, title='테스트 문서', raw_text='',
+    )
+    restructured = restructure_document(extracted=mock_extracted, plan=plan, refine=False)
+
+    output_dir = 'test_output'
+    os.makedirs(output_dir, exist_ok=True)
+    output_md = os.path.join(output_dir, 'test_hierarchy.md')
+    write_md(restructured, output_md)
+
+    with open(output_md, 'r', encoding='utf-8') as f:
+        md_content = f.read()
+
+    # MD에서 대분류(##)와 중분류(###) 개수 확인
+    h2_count = sum(1 for line in md_content.split('\n')
+                   if line.startswith('## ') and line != '## 목차')
+    h3_count = sum(1 for line in md_content.split('\n')
+                   if line.startswith('### '))
+
+    if h2_count < min_major:
+        errors.append(f"MD 대분류(##) {h2_count}개 < 최소 {min_major}개")
+    else:
+        print(f"  [PASS] MD 대분류(##) {h2_count}개 출력됨")
+
+    if h3_count == 0:
+        errors.append("MD 중분류(###)가 없음")
+    else:
+        print(f"  [PASS] MD 중분류(###) {h3_count}개 출력됨")
+
+    if errors:
+        print(f"\n[FAIL] {len(errors)}개 오류 발견:")
+        for err in errors:
+            print(f"  - {err}")
+    else:
+        print("\n[ALL PASS] 동적 가이드 + 계층 깊이 테스트 통과!")
+
+    return len(errors) == 0
+
+
 def main():
     """테스트 메인"""
     print("=" * 55)
@@ -466,7 +650,10 @@ def main():
     # Step 3: 엣지 케이스 테스트 (Ollama 불필요)
     passed = test_edge_cases(structured_path) and passed
 
-    # Step 4: 전체 파이프라인 테스트 (Ollama 필요)
+    # Step 4: 동적 가이드 + 계층 깊이 테스트 (Ollama 불필요)
+    passed = test_dynamic_guide_and_hierarchy() and passed
+
+    # Step 5: 전체 파이프라인 테스트 (Ollama 필요)
     if '--full' in sys.argv:
         print("\n" + "=" * 55)
         print("전체 파이프라인 테스트 (Ollama 필요)")
